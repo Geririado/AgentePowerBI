@@ -811,16 +811,29 @@ def _format_filter_value(val, col_tipo=None):
     elif isinstance(val, str):
         # Intentar parsear como fecha si parece una fecha
         if "/" in val or "-" in val:
-            try:
-                # Intentar parsear fechas en formato común
-                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S"]:
-                    try:
-                        dt = datetime.datetime.strptime(val.split()[0], fmt)
-                        return f"DATE({dt.year}, {dt.month}, {dt.day})"
-                    except:
-                        continue
-            except:
-                pass
+            # Eliminar hora si existe
+            fecha_parte = val.split()[0] if " " in val else val
+
+            # Lista de formatos a intentar
+            formatos_fecha = [
+                "%d/%m/%Y",      # 01/10/2023
+                "%Y-%m-%d",      # 2023-10-01
+                "%d-%m-%Y",      # 01-10-2023
+                "%Y/%m/%d",      # 2023/10/01
+                "%m/%d/%Y",      # 10/01/2023 (formato US)
+            ]
+
+            for fmt in formatos_fecha:
+                try:
+                    dt = datetime.datetime.strptime(fecha_parte, fmt)
+                    print(f"📅 Fecha parseada: {val} → DATE({dt.year}, {dt.month}, {dt.day})")
+                    return f"DATE({dt.year}, {dt.month}, {dt.day})"
+                except ValueError:
+                    continue
+
+            # Si llegamos aquí, no se pudo parsear como fecha
+            print(f"⚠️ No se pudo parsear fecha: {val}, usando como string")
+
         # Si no es fecha, escapar como string
         if not val.startswith('"'):
             return f'"{val}"'
@@ -1159,21 +1172,34 @@ def _fix_table_quotes_v2(dax: str) -> str:
     1. Tabla[Columna] → 'Tabla'[Columna]
     2. 'Tabla[Columna]' → 'Tabla'[Columna]
     3. 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col] (comillas anidadas)
+    4. 'Table-'guid'[Col]' → 'Table-guid'[Col] (comillas cortadas en GUIDs)
     """
 
-    # 1. Corregir comillas anidadas mal puestas: 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col]
-    dax = re.sub(r"'([^']+)\s+'([^']+)'\[", r"'\1 \2'[", dax)
+    # 1. CRÍTICO: Corregir nombres de tabla con GUIDs cortados
+    # Pattern: 'TableName-'restOfGuid'[Column]
+    # Ejemplo: 'DateTableTemplate_cb2f60f2-17a4-4889-b229-'e99fada39121'[NroMes]
+    # → 'DateTableTemplate_cb2f60f2-17a4-4889-b229-e99fada39121'[NroMes]
+    dax = re.sub(r"'([^']+)-'([^']+)'\[", r"'\1-\2'[", dax)
 
-    # 2. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
+    # 2. Corregir comillas anidadas mal puestas: 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col]
+    # Hacerlo múltiples veces por si hay anidación profunda
+    for _ in range(3):
+        dax = re.sub(r"'([^']+)\s+'([^']+)'\[", r"'\1 \2'[", dax)
+
+    # 3. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
     dax = re.sub(r"'([^']+)\[([^\]]+)\]'", r"'\1'[\2]", dax)
 
-    # 3. Corregir: Tabla[Columna] → 'Tabla'[Columna] (solo si no es función DAX)
+    # 4. Corregir condiciones con comillas anidadas: 'Tab' = "Val" && 'Tab'
+    # Patrón: palabra seguida de comilla simple sin espacio antes
+    dax = re.sub(r"(\w)'(\w)", r"\1 \2", dax)
+
+    # 5. Corregir: Tabla[Columna] → 'Tabla'[Columna] (solo si no es función DAX)
     funciones_dax = ["SUM", "COUNT", "AVERAGE", "MIN", "MAX", "COUNTROWS", "CALCULATE",
                      "SUMX", "FILTER", "ALL", "VALUES", "DISTINCT", "RELATED", "DATE",
                      "YEAR", "MONTH", "DAY", "TODAY", "NOW", "ROW", "SUMMARIZECOLUMNS",
-                     "CALCULATETABLE", "TOPN", "VAR", "RETURN"]
+                     "CALCULATETABLE", "TOPN", "VAR", "RETURN", "IF", "AND", "OR"]
 
-    pattern = r"(?<!')(\b[A-Za-z_][A-Za-z0-9_\s]*)\[([^\]]+)\]"
+    pattern = r"(?<!')(\b[A-Za-z_][A-Za-z0-9_\s\-]*)\[([^\]]+)\]"
 
     def replacer(match):
         tabla = match.group(1).strip()
