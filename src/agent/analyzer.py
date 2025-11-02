@@ -247,6 +247,28 @@ def _select_pattern(prompt: str) -> tuple[str, dict]:
 
 
 # ============================================
+# FILTRADO DE TABLAS IRRELEVANTES
+# ============================================
+def _filtrar_tablas_irrelevantes(contexto: list[dict]) -> list[dict]:
+    """
+    Filtra tablas generadas automáticamente por Power BI que no aportan valor al análisis
+    """
+    tablas_filtradas = []
+    for t in contexto:
+        nombre = t.get("nombre", "")
+        # Excluir tablas autogeneradas por Power BI
+        if nombre.startswith("LocalDateTable_") or \
+           nombre.startswith("DateTableTemplate_") or \
+           nombre == "_Medidas" or \
+           nombre == "_medidas":
+            continue
+        tablas_filtradas.append(t)
+
+    print(f"📊 Tablas filtradas: {len(contexto)} → {len(tablas_filtradas)} (eliminadas {len(contexto) - len(tablas_filtradas)} tablas irrelevantes)")
+    return tablas_filtradas
+
+
+# ============================================
 # EXTRACCIÓN DE PARÁMETROS CON GPT
 # ============================================
 def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict:
@@ -254,14 +276,18 @@ def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict
     GPT identifica QUÉ componentes usar (tablas, columnas, medidas)
     pero NO genera código DAX directamente
     """
-    
+
     dataset_name = ctx.get("cm_seleccionado", "")
-    
+
+    # 🆕 FILTRAR TABLAS IRRELEVANTES DEL CONTEXTO
+    ctx_filtrado = ctx.copy()
+    ctx_filtrado["contexto"] = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
+
     # 🆕 USAR SCHEMAS SI ESTÁN DISPONIBLES
     usar_schema = SCHEMAS_DISPONIBLES and dataset_name
     dimension_sugerida = None
     metrica_sugerida = None
-    
+
     if usar_schema:
         schema = get_schema(dataset_name)
         if schema:
@@ -271,20 +297,20 @@ def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict
                 tabla_persona, col_persona = persona_info
                 dimension_sugerida = f"'{tabla_persona}'[{col_persona}]"
                 print(f"📌 Schema sugiere dimensión: {dimension_sugerida}")
-            
+
             # Obtener métrica principal del schema
             metrica_info = get_metrica_principal(dataset_name)
             if metrica_info:
                 tabla_metrica, col_metrica = metrica_info
                 metrica_sugerida = f"SUM('{tabla_metrica}'[{col_metrica}])"
                 print(f"📌 Schema sugiere métrica: {metrica_sugerida}")
-    
+
     # Preparar contexto simplificado CON NOMBRES REALES DE COLUMNAS
     tablas_disponibles = []
-    for t in ctx["contexto"]:
+    for t in ctx_filtrado["contexto"]:
         if not t.get("muestra") or len(t["muestra"]) == 0:
             continue
-            
+
         # Obtener nombres reales de columnas y un ejemplo de valor
         cols_con_ejemplo = []
         for col_name, col_value in t["muestra"][0].items():
@@ -294,14 +320,14 @@ def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict
                 "ejemplo": ejemplo,
                 "tipo": type(col_value).__name__
             })
-        
+
         tablas_disponibles.append({
             "nombre": t["nombre"],
             "columnas": cols_con_ejemplo[:15],  # Limitar a 15 columnas
             "tipo": "fact" if "fact" in t["nombre"].lower() else "dimension"
         })
     
-    # Obtener medidas del modelo
+    # Obtener medidas del modelo (capturar errores silenciosamente)
     medidas_disponibles = []
     try:
         conn = _open_conn(ctx["cm_seleccionado"])
@@ -309,13 +335,18 @@ def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict
             tmap = _dmv_tables(conn)
             measures = _dmv_measures(conn, tmap)
             medidas_disponibles = [
-                {"tabla": m['tabla'], "medida": m['measure']} 
+                {"tabla": m['tabla'], "medida": m['measure']}
                 for m in measures
             ]
         finally:
             conn.Close()
     except Exception as e:
-        print(f"⚠️ No se pudieron obtener medidas: {e}")
+        # Error 401 u otros problemas de autenticación no deben interrumpir el flujo
+        error_msg = str(e)
+        if "401" in error_msg or "No autorizado" in error_msg:
+            print(f"⚠️ No se pudo acceder a medidas (problema de autenticación). Continuando sin medidas del modelo.")
+        else:
+            print(f"⚠️ No se pudieron obtener medidas: {e}")
     
     # 🆕 AÑADIR SUGERENCIAS DEL SCHEMA AL PROMPT
     sugerencias_schema = ""
@@ -424,45 +455,75 @@ Analiza y responde SOLO el JSON:"""
         return _fallback_parameters(prompt, ctx)
 
 
+def _corregir_sintaxis_referencia(ref: str) -> str:
+    """
+    Corrige sintaxis de referencia DAX.
+
+    Formatos incorrectos:
+    - 'Tabla[Columna]'  → 'Tabla'[Columna]
+    - Tabla[Columna]    → 'Tabla'[Columna]
+    - 'Tabla'[Tabla[Columna]] → 'Tabla'[Columna]
+    """
+    # 1. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
+    match_incorrecto = re.match(r"'([^']+)\[([^\]]+)\]'", ref)
+    if match_incorrecto:
+        tabla, columna = match_incorrecto.groups()
+        # Limpiar columna si tiene duplicación
+        if "[" in columna:
+            columna = columna.split("[")[-1].rstrip("]")
+        return f"'{tabla}'[{columna}]"
+
+    # 2. Corregir: Tabla[Columna] → 'Tabla'[Columna] (sin comillas)
+    match_sin_comillas = re.match(r"^([A-Za-z_][A-Za-z0-9_\s]*)\[([^\]]+)\]$", ref)
+    if match_sin_comillas and "'" not in ref:
+        tabla, columna = match_sin_comillas.groups()
+        tabla = tabla.strip()
+        if "[" in columna:
+            columna = columna.split("[")[-1].rstrip("]")
+        return f"'{tabla}'[{columna}]"
+
+    # 3. Ya tiene formato correcto: 'Tabla'[Columna]
+    match_correcto = re.match(r"'([^']+)'\[([^\]]+)\]", ref)
+    if match_correcto:
+        tabla, columna = match_correcto.groups()
+        # Limpiar si hay duplicación de tabla en columna
+        if "[" in columna:
+            columna = columna.split("[")[-1].rstrip("]")
+            return f"'{tabla}'[{columna}]"
+        return ref
+
+    # 4. No pudo parsear, devolver original
+    return ref
+
+
 def _validate_columns(params: dict, ctx: dict) -> dict:
     """
     Valida que las columnas especificadas en los parámetros existan en el contexto.
     Si no existen, intenta encontrar columnas similares.
     """
-    # Construir un mapa de todas las columnas disponibles
+    # Construir un mapa de todas las columnas disponibles (usar contexto filtrado)
+    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
     columnas_disponibles = {}
-    for t in ctx["contexto"]:
+    for t in ctx_filtrado:
         if t.get("muestra") and len(t["muestra"]) > 0:
             tabla_nombre = t["nombre"]
             cols = list(t["muestra"][0].keys())
             columnas_disponibles[tabla_nombre] = cols
-    
+
     # Validar dimension_columns
     dimension_cols_validadas = []
     for col_ref in params.get("dimension_columns", []):
-        # 🔧 CORRECCIÓN: Arreglar sintaxis incorrecta 'Tabla[Col]' → 'Tabla'[Col]
-        # Patrón incorrecto: 'Tabla[Columna]'
-        match_incorrecto = re.match(r"'([^']+)\[([^\]]+)\]'", col_ref)
-        if match_incorrecto:
-            tabla, columna = match_incorrecto.groups()
-            col_ref_correcto = f"'{tabla}'[{columna}]"
-            print(f"🔧 Corrigiendo sintaxis dimension: {col_ref} → {col_ref_correcto}")
-            col_ref = col_ref_correcto
-        
-        # Extraer tabla y columna de "'Tabla'[Columna]"
+        # 🔧 CORRECCIÓN ROBUSTA DE SINTAXIS
+        col_ref_corregido = _corregir_sintaxis_referencia(col_ref)
+        if col_ref_corregido != col_ref:
+            print(f"🔧 Corrigiendo sintaxis: {col_ref} → {col_ref_corregido}")
+            col_ref = col_ref_corregido
+
+        # Extraer tabla y columna
         match = re.match(r"'([^']+)'\[([^\]]+)\]", col_ref)
         if match:
             tabla, columna = match.groups()
-            
-            # 🔧 LIMPIAR: Eliminar prefijo de tabla si está duplicado
-            # Ej: 'stg RRHH_Users'[stg RRHH_Users[US_nombre]] → 'stg RRHH_Users'[US_nombre]
-            if "[" in columna and "]" in columna:
-                # Extraer solo el nombre de columna
-                columna_limpia = columna.split("[")[-1].rstrip("]")
-                col_ref = f"'{tabla}'[{columna_limpia}]"
-                print(f"🔧 Limpiando columna duplicada: {columna} → {columna_limpia}")
-                columna = columna_limpia
-            
+
             if tabla in columnas_disponibles:
                 if columna in columnas_disponibles[tabla]:
                     dimension_cols_validadas.append(col_ref)
@@ -476,7 +537,7 @@ def _validate_columns(params: dict, ctx: dict) -> dict:
                         print(f"❌ Columna no encontrada: {col_ref}")
             else:
                 print(f"❌ Tabla no encontrada: {tabla}")
-    
+
     params["dimension_columns"] = dimension_cols_validadas
     
     # Validar metric_expression (si es una columna, no una medida)
@@ -607,20 +668,23 @@ def _find_similar_column(target: str, available_cols: list) -> str | None:
 def _fallback_parameters(prompt: str, ctx: dict) -> dict:
     """Extracción de parámetros con heurísticas si GPT falla"""
     print("⚠️ Usando extracción heurística de parámetros")
-    
+
     dataset_name = ctx.get("cm_seleccionado", "")
-    
+
+    # Usar contexto filtrado
+    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
+
     # 🆕 INTENTAR USAR SCHEMA PRIMERO
     if SCHEMAS_DISPONIBLES and dataset_name:
         schema = get_schema(dataset_name)
         if schema:
             print("📌 Usando información del schema")
-            
+
             # Obtener tabla principal
             tabla_principal = schema.get("tabla_principal", "None")
             if tabla_principal == "None" and schema.get("tablas_fact"):
                 tabla_principal = schema["tablas_fact"][0]
-            
+
             # Obtener dimensión de persona
             dimension_col = None
             persona_info = get_columna_nombre_persona(dataset_name)
@@ -628,7 +692,7 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                 tabla_persona, col_persona = persona_info
                 dimension_col = f"'{tabla_persona}'[{col_persona}]"
                 print(f"✅ Dimensión desde schema: {dimension_col}")
-            
+
             # Obtener métrica
             metric_col = None
             metrica_info = get_metrica_principal(dataset_name)
@@ -636,7 +700,7 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                 tabla_metrica, col_metrica = metrica_info
                 metric_col = f"SUM('{tabla_metrica}'[{col_metrica}])"
                 print(f"✅ Métrica desde schema: {metric_col}")
-            
+
             if dimension_col or metric_col:
                 return {
                     "tabla_principal": tabla_principal,
@@ -646,22 +710,22 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                     "filters": [],
                     "n": 10
                 }
-    
+
     # Fallback original si no hay schema
     # Buscar tabla principal (primera fact o primera tabla)
     tabla_principal = next(
-        (t["nombre"] for t in ctx["contexto"] if "fact" in t["nombre"].lower()),
-        ctx["contexto"][0]["nombre"] if ctx["contexto"] else ""
+        (t["nombre"] for t in ctx_filtrado if "fact" in t["nombre"].lower()),
+        ctx_filtrado[0]["nombre"] if ctx_filtrado else ""
     )
     
     # Buscar columna de dimensión (nombre, usuario, empleado)
     # Priorizar tablas DIM y stg con información de usuarios
     dimension_col = None
     prioridad_tablas = ["stg RRHH_Users", "DIM_Responsable", "stg GEN_DptoRRHH"]
-    
+
     # Primero buscar en tablas prioritarias
     for tabla_name in prioridad_tablas:
-        t = next((tab for tab in ctx["contexto"] if tab["nombre"] == tabla_name), None)
+        t = next((tab for tab in ctx_filtrado if tab["nombre"] == tabla_name), None)
         if t and t.get("muestra"):
             cols = list(t["muestra"][0].keys())
             # Buscar columnas descriptivas, evitando IDs
@@ -673,10 +737,10 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                         break
             if dimension_col:
                 break
-    
+
     # Si no encontró en tablas prioritarias, buscar en todas
     if not dimension_col:
-        for t in ctx["contexto"]:
+        for t in ctx_filtrado:
             if t.get("muestra"):
                 cols = list(t["muestra"][0].keys())
                 for col in cols:
@@ -687,12 +751,12 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                             break
                 if dimension_col:
                     break
-    
+
     # Buscar columna numérica (priorizar columnas con keywords relevantes)
     metric_col = None
     keywords_metricas = ["saldo", "dias", "horas", "importe", "total", "cantidad", "valor"]
-    
-    for t in ctx["contexto"]:
+
+    for t in ctx_filtrado:
         if t.get("muestra") and t["muestra"]:
             # Primero buscar con keywords
             for col, val in t["muestra"][0].items():
@@ -703,10 +767,10 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                         break
             if metric_col:
                 break
-    
+
     # Si no encontró con keywords, usar cualquier numérica
     if not metric_col:
-        for t in ctx["contexto"]:
+        for t in ctx_filtrado:
             if t.get("muestra") and t["muestra"]:
                 for col, val in t["muestra"][0].items():
                     if isinstance(val, (int, float)) and not any(k in col.lower() for k in ["id", "key", "codigo"]):
@@ -728,33 +792,72 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
 # ============================================
 # CONSTRUCCIÓN DE DAX DESDE PATRÓN
 # ============================================
+def _format_filter_value(val, col_tipo=None):
+    """
+    Formatea un valor de filtro según su tipo para DAX.
+
+    Args:
+        val: Valor a formatear
+        col_tipo: Tipo de la columna (opcional) para detectar fechas
+
+    Returns:
+        str: Valor formateado para DAX
+    """
+    # Detectar fechas
+    if isinstance(val, datetime.datetime):
+        return f"DATE({val.year}, {val.month}, {val.day})"
+    elif isinstance(val, datetime.date):
+        return f"DATE({val.year}, {val.month}, {val.day})"
+    elif isinstance(val, str):
+        # Intentar parsear como fecha si parece una fecha
+        if "/" in val or "-" in val:
+            try:
+                # Intentar parsear fechas en formato común
+                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S"]:
+                    try:
+                        dt = datetime.datetime.strptime(val.split()[0], fmt)
+                        return f"DATE({dt.year}, {dt.month}, {dt.day})"
+                    except:
+                        continue
+            except:
+                pass
+        # Si no es fecha, escapar como string
+        if not val.startswith('"'):
+            return f'"{val}"'
+        return val
+    elif isinstance(val, (int, float)):
+        return str(val)
+    else:
+        return str(val)
+
+
 def _build_dax_from_pattern(pattern: dict, params: dict) -> str:
-    """Construye query DAX aplicando el patrón con los parámetros extraídos"""
-    
+    """
+    Construye query DAX aplicando el patrón con los parámetros extraídos.
+
+    IMPORTANTE: Cuando hay filtros con SUMMARIZECOLUMNS, usa CALCULATETABLE para evitar errores.
+    """
+
     template = pattern["template"]
-    
+
     # Construir componentes
     dimension_cols = ", ".join(params.get("dimension_columns", [])) if params.get("dimension_columns") else ""
     metric_expr = params.get("metric_expression", "1")
     metric_name = params.get("metric_name", "Resultado")
-    
-    # ✅ Si no hay dimension_columns, usar pattern de valor único
+    tiene_filtros = bool(params.get("filters"))
+
+    # ✅ Si no hay dimension_columns, usar ROW() para valor único
     if not dimension_cols and "SUMMARIZECOLUMNS" in template:
-        # Cambiar a ROW() para valor único
-        filters_str = ""
-        if params.get("filters"):
+        if tiene_filtros:
             filter_parts = []
             for f in params["filters"]:
-                col = f["column"]
+                col = _corregir_sintaxis_referencia(f["column"])
                 op = f.get("operator", "=")
-                val = f["value"]
-                if isinstance(val, str) and not val.startswith('"'):
-                    val = f'"{val}"'
+                val = _format_filter_value(f["value"])
                 filter_parts.append(f"{col} {op} {val}")
-            if filter_parts:
-                filters_str = ", " + ", ".join(filter_parts)
-        
-        if filters_str:
+
+            filters_str = ",\n        " + ",\n        ".join(filter_parts)
+
             dax = f"""EVALUATE
 ROW(
     "{metric_name}", CALCULATE(
@@ -767,38 +870,53 @@ ROW(
     "{metric_name}", {metric_expr}
 )"""
         return dax.strip()
-    
-    # Construir filtros
-    filters_str = ""
-    if params.get("filters"):
+
+    # ✅ CORRECCIÓN PRINCIPAL: Cuando hay filtros Y dimension_columns, usar CALCULATETABLE
+    if tiene_filtros and dimension_cols:
+        # Construir filtros correctamente formateados
         filter_parts = []
         for f in params["filters"]:
-            col = f["column"]
+            col = _corregir_sintaxis_referencia(f["column"])
             op = f.get("operator", "=")
-            val = f["value"]
-            
-            # 🔧 CORRECCIÓN: Arreglar sintaxis en filtros también
-            # Patrón incorrecto: 'Tabla[Columna]'
-            match_incorrecto = re.match(r"'([^']+)\[([^\]]+)\]'", col)
-            if match_incorrecto:
-                tabla, columna = match_incorrecto.groups()
-                # Limpiar columna si tiene duplicación
-                if "[" in columna and "]" in columna:
-                    columna = columna.split("[")[-1].rstrip("]")
-                col = f"'{tabla}'[{columna}]"
-                print(f"🔧 Corrigiendo filtro: {f['column']} → {col}")
-            
-            # Escapar strings
-            if isinstance(val, str) and not val.startswith('"'):
-                val = f'"{val}"'
-            
+            val = _format_filter_value(f["value"])
             filter_parts.append(f"{col} {op} {val}")
-        
-        if filter_parts:
-            filters_str = ",\n    " + ",\n    ".join(filter_parts)
-    
-    # Aplicar template según el patrón
+
+        filters_str = ",\n    " + ",\n    ".join(filter_parts)
+
+        # Usar CALCULATETABLE en lugar de poner filtros directamente en SUMMARIZECOLUMNS
+        dax = f"""EVALUATE
+CALCULATETABLE(
+    SUMMARIZECOLUMNS(
+        {dimension_cols},
+        "{metric_name}", {metric_expr}
+    ){filters_str}
+)"""
+        return dax.strip()
+
+    # Sin filtros, usar SUMMARIZECOLUMNS normal
+    if dimension_cols:
+        dax = f"""EVALUATE
+SUMMARIZECOLUMNS(
+    {dimension_cols},
+    "{metric_name}", {metric_expr}
+)"""
+        return dax.strip()
+
+    # Fallback: usar template original (para patterns especiales como top_n)
     try:
+        # Construir filtros para template (si existen)
+        filters_str = ""
+        if tiene_filtros:
+            filter_parts = []
+            for f in params["filters"]:
+                col = _corregir_sintaxis_referencia(f["column"])
+                op = f.get("operator", "=")
+                val = _format_filter_value(f["value"])
+                filter_parts.append(f"{col} {op} {val}")
+
+            if filter_parts:
+                filters_str = ",\n    " + ",\n    ".join(filter_parts)
+
         dax = template.format(
             dimension_columns=dimension_cols,
             filters=filters_str,
@@ -1029,116 +1147,174 @@ Respuesta como analista de FEMXA:"""
 # ============================================
 # FALLBACK: GPT GENERA DAX COMPLETO
 # ============================================
-def _fix_table_quotes(dax: str) -> str:
+# NOTA: La función _fix_table_quotes fue reemplazada por _fix_table_quotes_v2 (más abajo)
+# que maneja más casos de corrección de sintaxis
+
+
+def _fix_table_quotes_v2(dax: str) -> str:
     """
-    Corrige referencias a tablas sin comillas en DAX.
-    Convierte: FACT_SaldoVacaciones[Columna]
-    A:         'FACT_SaldoVacaciones'[Columna]
+    Versión mejorada: Corrige referencias a tablas y columnas en DAX.
+
+    Problemas comunes que corrige:
+    1. Tabla[Columna] → 'Tabla'[Columna]
+    2. 'Tabla[Columna]' → 'Tabla'[Columna]
+    3. 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col] (comillas anidadas)
     """
-    # Pattern: NombreTabla[Columna] donde NombreTabla no tiene comillas
-    # Busca palabras seguidas de [ pero que no estén precedidas por '
+
+    # 1. Corregir comillas anidadas mal puestas: 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col]
+    dax = re.sub(r"'([^']+)\s+'([^']+)'\[", r"'\1 \2'[", dax)
+
+    # 2. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
+    dax = re.sub(r"'([^']+)\[([^\]]+)\]'", r"'\1'[\2]", dax)
+
+    # 3. Corregir: Tabla[Columna] → 'Tabla'[Columna] (solo si no es función DAX)
+    funciones_dax = ["SUM", "COUNT", "AVERAGE", "MIN", "MAX", "COUNTROWS", "CALCULATE",
+                     "SUMX", "FILTER", "ALL", "VALUES", "DISTINCT", "RELATED", "DATE",
+                     "YEAR", "MONTH", "DAY", "TODAY", "NOW", "ROW", "SUMMARIZECOLUMNS",
+                     "CALCULATETABLE", "TOPN", "VAR", "RETURN"]
+
     pattern = r"(?<!')(\b[A-Za-z_][A-Za-z0-9_\s]*)\[([^\]]+)\]"
-    
+
     def replacer(match):
         tabla = match.group(1).strip()
         columna = match.group(2)
-        # No corregir funciones DAX conocidas
-        funciones_dax = ["SUM", "COUNT", "AVERAGE", "MIN", "MAX", "COUNTROWS", "CALCULATE", 
-                         "SUMX", "FILTER", "ALL", "VALUES", "DISTINCT", "RELATED"]
+        # No corregir funciones DAX
         if tabla.upper() in funciones_dax:
             return match.group(0)
         return f"'{tabla}'[{columna}]"
-    
-    dax_corregido = re.sub(pattern, replacer, dax)
-    
-    if dax_corregido != dax:
-        print(f"🔧 DAX corregido automáticamente:")
-        print(f"Antes: {dax[:100]}...")
-        print(f"Después: {dax_corregido[:100]}...")
-    
-    return dax_corregido
+
+    dax = re.sub(pattern, replacer, dax)
+
+    return dax
 
 
 def _fallback_gpt_pure(prompt: str, ctx: dict) -> dict:
     """
-    Último recurso: GPT genera DAX completo desde cero
-    Solo se usa si el sistema de patterns falla
+    Último recurso: GPT genera DAX completo desde cero.
+    Incluye validación y corrección automática del código generado.
     """
     print("⚠️ Usando fallback: GPT genera DAX completo")
-    
+
+    # Usar contexto filtrado (sin LocalDateTable)
+    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
+
     schema_simple = []
-    for t in ctx["contexto"][:5]:
+    for t in ctx_filtrado[:8]:  # Limitar a 8 tablas relevantes
         cols = list(t["muestra"][0].keys()) if t.get("muestra") else []
         schema_simple.append({
             "tabla": t["nombre"],
-            "columnas": cols[:10]
+            "columnas": cols[:12],
+            "filas": len(t.get("muestra", []))
         })
-    
-    prompt_gpt = f"""Eres experto en Power BI DAX.
 
-PREGUNTA: {prompt}
+    prompt_gpt = f"""Eres un experto en Power BI DAX. Genera queries VÁLIDAS y EJECUTABLES.
 
-SCHEMA:
+PREGUNTA DEL USUARIO:
+{prompt}
+
+SCHEMA DISPONIBLE (tablas y columnas reales):
 {json.dumps(schema_simple, indent=2, ensure_ascii=False)}
 
-Genera una query DAX VÁLIDA usando EVALUATE.
+REGLAS CRÍTICAS DE SINTAXIS DAX:
+1. SIEMPRE usa comillas simples alrededor de nombres de tabla: 'NombreTabla'[Columna]
+2. NUNCA pongas comillas alrededor de todo: 'Tabla[Columna]' ← INCORRECTO
+3. Para filtros con dimensiones, USA CALCULATETABLE:
+   CALCULATETABLE(SUMMARIZECOLUMNS(...), Filtro1, Filtro2)
+4. Para fechas, USA DATE(): DATE(2025, 10, 27) no strings
+5. VERIFICA que tablas y columnas existen en el schema
 
-EJEMPLOS DE SINTAXIS:
+EJEMPLOS CORRECTOS:
 
-// Agregación con grupo
+// Agregación simple por persona
 EVALUATE
 SUMMARIZECOLUMNS(
-    'DimEmpleado'[Nombre],
-    "Total", SUM('FactVacaciones'[Dias])
+    'stg RRHH_Users'[US_nombre],
+    "Total Días", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
 )
 
-// Con filtro temporal
+// Con filtros (usa CALCULATETABLE)
 EVALUATE
 CALCULATETABLE(
     SUMMARIZECOLUMNS(
-        'DimEmpleado'[Nombre],
-        "Total", [Medida]
+        'stg RRHH_Users'[US_nombre],
+        "Total", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
     ),
-    'DimFecha'[Año] = 2024
+    'stg RRHH_Users'[US_nombre] = "Juan",
+    'FechaCalendario'[Year] = 2025
 )
 
-// Valor único
+// Valor único sin dimensiones
 EVALUATE
-ROW("Total", SUM('FactVacaciones'[Dias]))
+ROW(
+    "Total General", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
+)
 
-Genera SOLO el código DAX sin explicaciones ni markdown:"""
-    
+// Con filtro de fecha
+EVALUATE
+CALCULATETABLE(
+    SUMMARIZECOLUMNS(
+        'stg GEN_DptoRRHH'[DR_nombre],
+        "Total", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
+    ),
+    'FACT_SaldoVacaciones'[fecha] = DATE(2025, 10, 27)
+)
+
+GENERA SOLO EL CÓDIGO DAX sin markdown ni explicaciones:"""
+
     try:
         response = openai.ChatCompletion.create(
             engine=DEPLOYMENT_GPT4O,
             temperature=0,
-            max_tokens=600,
+            max_tokens=800,
             messages=[
-                {"role": "system", "content": "Eres un experto en DAX. Respondes SOLO código sin explicaciones."},
+                {
+                    "role": "system",
+                    "content": "Eres un experto en DAX de Power BI. Generas código ejecutable y correcto. Respondes SOLO código DAX sin explicaciones, markdown ni comentarios."
+                },
                 {"role": "user", "content": prompt_gpt}
             ]
         )
-        
+
         dax = response["choices"][0]["message"]["content"].strip()
+
+        # Limpiar markdown
         dax = re.sub(r'```dax\n?|```\n?', '', dax)
-        
-        # ✅ CORRECCIÓN AUTOMÁTICA: Añadir comillas a nombres de tabla
-        dax = _fix_table_quotes(dax)
-        
-        df = _ejecutar_dax(dax, ctx["cm_seleccionado"])
+        dax = dax.strip()
+
+        print(f"🤖 DAX generado por GPT:\n{dax[:200]}...")
+
+        # ✅ CORRECCIÓN AUTOMÁTICA MEJORADA
+        dax_corregido = _fix_table_quotes_v2(dax)
+
+        if dax_corregido != dax:
+            print(f"🔧 DAX corregido automáticamente (mostrando primeras diferencias)")
+
+        df = _ejecutar_dax(dax_corregido, ctx["cm_seleccionado"])
         text = _resumir_resultado(df, prompt)
-        
+
         return {
             "text": text,
-            "query": dax,
+            "query": dax_corregido,
             "preview": df.head(10).to_dict(orient="records"),
             "method": "gpt_fallback"
         }
-        
+
     except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Fallback GPT falló: {error_msg}")
+
+        # Dar feedback específico según el error
+        if "No se encuentra la tabla" in error_msg:
+            return {
+                "text": f"❌ No pude encontrar las tablas necesarias en el modelo. Tablas disponibles: {', '.join([t['tabla'] for t in schema_simple[:5]])}",
+                "query": dax_corregido if 'dax_corregido' in locals() else "",
+                "preview": [],
+                "method": "failed"
+            }
+
         return {
-            "text": f"❌ No pude generar una query válida. Error: {str(e)}",
-            "query": "",
+            "text": f"❌ No pude generar una query válida. Error: {error_msg}",
+            "query": dax_corregido if 'dax_corregido' in locals() else "",
             "preview": [],
             "method": "failed"
         }
@@ -1196,8 +1372,10 @@ ROW(
         
         # Query 2: Si hay filtros o condiciones específicas, contar con esas condiciones
         if "finalizado" in prompt_lower or "completado" in prompt_lower or "terminado" in prompt_lower:
+            # Usar contexto filtrado
+            ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
             # Intentar encontrar columna de estado
-            for t in ctx["contexto"]:
+            for t in ctx_filtrado:
                 if t["nombre"] == tabla_principal and t.get("muestra"):
                     cols_raw = list(t["muestra"][0].keys())
                     # Limpiar nombres de columnas (eliminar prefijos de tabla)
@@ -1208,13 +1386,13 @@ ROW(
                         else:
                             col_limpia = col
                         cols.append(col_limpia)
-                    
+
                     col_estado = None
                     for col in cols:
                         if any(k in col.lower() for k in ["finalizado", "completado", "estado", "status", "apto"]):
                             col_estado = col
                             break
-                    
+
                     if col_estado:
                         query_condicion = f"""EVALUATE
 ROW(
