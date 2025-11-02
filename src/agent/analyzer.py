@@ -408,6 +408,11 @@ REGLAS CRÍTICAS DE SINTAXIS:
 10. Para agregaciones por persona/empleado:
     - Primero busca en tablas "DIM" o tablas que tengan "User", "Empleado", "RRHH"
     - Usa columnas descriptivas (nombre completo, apellidos) NO IDs
+11. IMPORTANTE - Filtros geográficos (ciudades, provincias, comunidades):
+    - Si preguntan por "Madrid", "Barcelona", etc. → Busca columnas con "ciudad", "provincia", "localidad", "nombre", "modalidad"
+    - NUNCA uses columnas con "id", "codigo", "key" para filtrar por nombres de ciudades
+    - Ejemplo CORRECTO: 'Dim_cursosdeaccion'[NombreSimple] = "Madrid"
+    - Ejemplo INCORRECTO: 'Dim_cursosdeaccion'[idaccioncur] = 28024
 
 Ejemplos de metric_expression correctos:
 - [Total Vacaciones]  (si existe la medida)
@@ -1014,161 +1019,86 @@ def _ejecutar_dax(dax_query: str, dataset_name: str) -> pd.DataFrame:
 
 
 # ============================================
-# RESUMEN DE RESULTADOS (REFACTORIZADO CON CONTEXTO FEMXA)
+# RESUMEN DE RESULTADOS (OPTIMIZADO)
 # ============================================
-def _resumir_resultado_multiple(df_principal: pd.DataFrame, todos_resultados: dict, user_prompt: str) -> str:
-    """
-    GPT genera respuesta considerando múltiples queries ejecutadas.
-    Responde como analista de FEMXA con conocimiento del sector formativo.
-    """
-    
-    if df_principal.empty:
-        return "La consulta principal no devolvió resultados."
-    
-    # Preparar contexto con todos los resultados
-    contexto_completo = {
-        "query_principal": {
-            "datos": df_principal.head(10).to_dict(orient="records"),
-            "filas_totales": len(df_principal)
-        }
-    }
-    
-    # Añadir queries complementarias
-    for key, resultado in todos_resultados.items():
-        if key != "principal":
-            contexto_completo[key] = {
-                "proposito": resultado.get("proposito", ""),
-                "descripcion": resultado.get("descripcion", ""),
-                "datos": resultado.get("preview", [])
-            }
-    
-    # 🆕 PROMPT REFACTORIZADO CON CONTEXTO FEMXA
-    prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional y capacitación.
+# Prompt base reutilizable
+_FEMXA_SYSTEM_MSG = """Eres un analista de datos de FEMXA, empresa de formación profesional.
+Interpretas datos académicos, de RRHH y operativos.
+Comunicas resultados con precisión usando terminología educativa.
+Eres profesional, claro y orientado a insights accionables."""
 
-CONTEXTO EMPRESARIAL:
-- FEMXA se dedica a la gestión de cursos, programas formativos y capacitación profesional
-- Trabajas con datos de: alumnos/estudiantes, instructores/formadores, cursos, asistencias, calificaciones, 
-  vacaciones del personal docente, horas lectivas, matriculaciones, finalizaciones
-- Tu rol es interpretar datos del sistema de gestión y proporcionar insights claros para la toma de decisiones
-
-PREGUNTA DEL USUARIO:
-"{user_prompt}"
-
-RESULTADOS DE MÚLTIPLES QUERIES EN POWER BI:
-{json.dumps(contexto_completo, ensure_ascii=False, indent=2, default=_to_json_safe)}
-
-INSTRUCCIONES:
-1. Analiza TODOS los resultados proporcionados
-2. Si la pregunta pide porcentajes o ratios, CALCULA el valor exacto usando los datos disponibles
-3. Responde directamente con cifras específicas y contexto relevante
-4. Usa terminología del sector formativo cuando sea apropiado:
-   - "alumnos" o "estudiantes" en lugar de "usuarios" o "registros"
-   - "cursos" o "programas formativos" en lugar de "items"
-   - "instructores" o "formadores" en lugar de "personal"
-   - "finalizaciones" en lugar de "completados"
-5. Sé preciso con números, porcentajes y métricas
-6. Usa lenguaje profesional pero cercano
-7. Sé conciso (máximo 4-5 líneas)
-
-EJEMPLOS DE BUENAS RESPUESTAS:
-- "El 75% de los alumnos han finalizado exitosamente el curso. De 400 estudiantes matriculados, 300 completaron el programa formativo."
-- "En el área de Recursos Humanos hay 8 empleados con saldo de vacaciones pendientes, acumulando un total de 125 días."
-- "Los 5 formadores con más horas lectivas acumulan entre 180 y 220 horas cada uno durante este trimestre."
-
-Genera tu respuesta como analista de FEMXA:"""
-    
-    try:
-        response = openai.ChatCompletion.create(
-            engine=DEPLOYMENT_GPT4O,
-            temperature=0.3,
-            max_tokens=500,
-            messages=[
-                {
-                    "role": "system", 
-                    "content": """Eres un analista de datos de FEMXA, empresa de formación profesional. 
-                    Interpretas datos de gestión académica, RRHH y operaciones formativas. 
-                    Comunicas resultados con precisión usando terminología del sector educativo.
-                    Eres profesional, claro y orientado a insights accionables."""
-                },
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"⚠️ Error generando resumen multi-query: {e}")
-        # Fallback: descripción simple
-        total_principal = len(df_principal)
-        return f"Análisis completado. Query principal: {total_principal} registros. Queries adicionales ejecutadas: {len(todos_resultados) - 1}"
-
-
-def _resumir_resultado(df: pd.DataFrame, user_prompt: str) -> str:
-    """
-    GPT genera respuesta en lenguaje natural basándose en los datos.
-    Responde como analista de FEMXA con conocimiento del sector formativo.
-    """
-    
-    if df.empty:
-        return "La consulta no devolvió resultados."
-    
-    preview = df.head(20).to_dict(orient="records")
-    
-    # 🆕 PROMPT REFACTORIZADO CON CONTEXTO FEMXA
-    prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional y capacitación.
-
-CONTEXTO EMPRESARIAL:
+_FEMXA_CONTEXT = """CONTEXTO EMPRESARIAL:
 - FEMXA gestiona programas formativos, cursos profesionales y capacitación
 - Datos típicos: alumnos, instructores, cursos, asistencias, calificaciones, vacaciones, horas lectivas
-- Tu audiencia son gestores, coordinadores académicos y responsables de RRHH
+- Tu audiencia son gestores, coordinadores académicos y responsables de RRHH"""
 
-PREGUNTA DEL USUARIO:
-"{user_prompt}"
+def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dict = None) -> str:
+    """
+    Función unificada para generar resumen en lenguaje natural.
+    Soporta tanto queries simples como múltiples.
+    """
+    if df.empty:
+        return "La consulta no devolvió resultados."
 
-RESULTADOS DE POWER BI:
-{json.dumps(preview, ensure_ascii=False, indent=2, default=_to_json_safe)}
+    # Preparar datos según tipo de query
+    if todos_resultados:
+        # Multi-query: Incluir todas las queries
+        contexto_datos = {
+            "query_principal": {
+                "datos": df.head(10).to_dict(orient="records"),
+                "filas_totales": len(df)
+            }
+        }
+        for key, res in todos_resultados.items():
+            if key != "principal":
+                contexto_datos[key] = {
+                    "proposito": res.get("proposito", ""),
+                    "descripcion": res.get("descripcion", ""),
+                    "datos": res.get("preview", [])
+                }
+        max_tokens = 500
+    else:
+        # Query simple
+        contexto_datos = df.head(20).to_dict(orient="records")
+        max_tokens = 400
+
+    prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional.
+
+{_FEMXA_CONTEXT}
+
+PREGUNTA: "{user_prompt}"
+
+RESULTADOS POWER BI:
+{json.dumps(contexto_datos, ensure_ascii=False, indent=2, default=_to_json_safe)}
 
 INSTRUCCIONES:
-1. Responde directamente a la pregunta usando los datos
-2. Menciona las cifras y datos más relevantes
-3. Si hay muchos registros, resume los principales hallazgos
-4. Usa terminología del sector formativo:
-   - "alumnos/estudiantes" (no "usuarios" o "clientes")
-   - "cursos/programas formativos" (no "productos")
-   - "instructores/formadores" (no "recursos")
-   - "finalizaciones/completados" (no "cerrados")
-5. Lenguaje profesional, claro y orientado a acción
-6. Sé conciso (máximo 4-5 líneas)
+1. Responde directamente usando los datos
+2. Usa terminología formativa: alumnos, cursos, instructores, finalizaciones
+3. Sé preciso con números y porcentajes
+4. Conciso (máx 4-5 líneas)
 
 EJEMPLOS:
-- "Los 10 alumnos con mejor rendimiento han obtenido calificaciones entre 9.2 y 9.8 en el programa de capacitación técnica."
-- "El personal docente del área de Idiomas tiene un saldo promedio de 18 días de vacaciones pendientes."
-- "Se han identificado 45 estudiantes que no han completado el 75% de asistencias requeridas en sus cursos actuales."
+- "El 75% de alumnos finalizaron. De 400 matriculados, 300 completaron el curso."
+- "8 empleados RRHH tienen 125 días de vacaciones pendientes en total."
 
-Respuesta como analista de FEMXA:"""
-    
+Respuesta como analista FEMXA:"""
+
     try:
         response = openai.ChatCompletion.create(
             engine=DEPLOYMENT_GPT4O,
             temperature=0.3,
-            max_tokens=400,
+            max_tokens=max_tokens,
             messages=[
-                {
-                    "role": "system", 
-                    "content": """Eres un analista de datos de FEMXA, empresa de formación profesional.
-                    Interpretas datos académicos, de RRHH y operativos.
-                    Comunicas resultados de forma clara, profesional y usando terminología educativa.
-                    Das respuestas directas con datos específicos y contexto relevante."""
-                },
+                {"role": "system", "content": _FEMXA_SYSTEM_MSG},
                 {"role": "user", "content": prompt}
             ]
         )
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"⚠️ Error generando resumen: {e}")
-        # Fallback: descripción simple con terminología FEMXA
         if len(df) == 1 and len(df.columns) == 1:
             return f"El resultado es: {df.iloc[0, 0]}"
-        else:
-            return f"Se encontraron {len(df)} registros en el sistema de gestión. Primeros resultados: {df.head(3).to_dict(orient='records')}"
+        return f"Se encontraron {len(df)} registros. Preview: {df.head(3).to_dict(orient='records')}"
 
 
 # ============================================
@@ -1494,7 +1424,38 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
         
         # 4️⃣ Ejecutar query principal
         df_principal = _ejecutar_dax(dax_query, dataset_name)
-        
+
+        # 🔁 SISTEMA DE RETRY: Si devuelve 0 resultados, intentar estrategias alternativas
+        if df_principal.empty and params.get("filters"):
+            print("⚠️ Query devolvió 0 resultados. Intentando estrategias alternativas...")
+
+            # Estrategia 1: Intentar sin filtros para verificar si hay datos
+            params_sin_filtros = params.copy()
+            params_sin_filtros["filters"] = []
+            dax_sin_filtros = _build_dax_from_pattern(pattern, params_sin_filtros)
+
+            try:
+                df_test = _ejecutar_dax(dax_sin_filtros, dataset_name)
+                if not df_test.empty:
+                    print(f"✅ Datos encontrados sin filtros ({len(df_test)} filas). El filtro aplicado puede ser incorrecto.")
+                    print("🔄 Intentando fallback GPT con contexto de filtros incorrectos...")
+
+                    # Usar fallback GPT con información adicional
+                    fallback_result = _fallback_gpt_pure(user_prompt, ctx)
+                    if fallback_result["method"] != "failed":
+                        return fallback_result
+            except:
+                pass
+
+            # Estrategia 2: Buscar columnas descriptivas en lugar de IDs
+            if any("id" in f["column"].lower() for f in params.get("filters", [])):
+                print("🔄 Filtro usa columnas ID. Buscando columnas descriptivas alternativas...")
+                # Intentar fallback GPT que suele elegir mejores columnas
+                fallback_result = _fallback_gpt_pure(user_prompt, ctx)
+                if fallback_result["method"] != "failed":
+                    df_principal = pd.DataFrame(fallback_result["preview"])
+                    dax_query = fallback_result["query"]
+
         resultados = {
             "principal": {
                 "query": dax_query,
@@ -1502,7 +1463,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
                 "preview": df_principal.head(20).to_dict(orient="records")
             }
         }
-        
+
         # 5️⃣ Generar y ejecutar queries complementarias si es necesario
         if requiere_multi:
             print("🔢 Generando queries complementarias...")
@@ -1523,8 +1484,8 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
                     print(f"   ⚠️ Error en query complementaria {i}: {e}")
                     continue
         
-        # 6️⃣ Resumir todos los resultados (CON CONTEXTO FEMXA)
-        text = _resumir_resultado_multiple(df_principal, resultados, user_prompt) if requiere_multi else _resumir_resultado(df_principal, user_prompt)
+        # 6️⃣ Resumir todos los resultados
+        text = _resumir_resultado(df_principal, user_prompt, resultados if requiere_multi else None)
         
         return {
             "text": text,
