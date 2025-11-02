@@ -809,7 +809,24 @@ def _format_filter_value(val, col_tipo=None):
     elif isinstance(val, datetime.date):
         return f"DATE({val.year}, {val.month}, {val.day})"
     elif isinstance(val, str):
-        # Intentar parsear como fecha si parece una fecha
+        # 1. Intentar convertir a número si es string numérico
+        # Esto evita errores de comparación Integer vs Text
+        if val.strip().replace('.', '', 1).replace('-', '', 1).isdigit():
+            # Es un número (puede tener punto decimal o signo negativo)
+            try:
+                # Intentar como float primero
+                num_val = float(val)
+                # Si es entero, devolver sin decimales
+                if num_val == int(num_val):
+                    print(f"🔢 Número detectado: \"{val}\" → {int(num_val)}")
+                    return str(int(num_val))
+                else:
+                    print(f"🔢 Número detectado: \"{val}\" → {num_val}")
+                    return str(num_val)
+            except ValueError:
+                pass
+
+        # 2. Intentar parsear como fecha si parece una fecha
         if "/" in val or "-" in val:
             # Eliminar hora si existe
             fecha_parte = val.split()[0] if " " in val else val
@@ -831,10 +848,7 @@ def _format_filter_value(val, col_tipo=None):
                 except ValueError:
                     continue
 
-            # Si llegamos aquí, no se pudo parsear como fecha
-            print(f"⚠️ No se pudo parsear fecha: {val}, usando como string")
-
-        # Si no es fecha, escapar como string
+        # 3. Si no es número ni fecha, escapar como string
         if not val.startswith('"'):
             return f'"{val}"'
         return val
@@ -1189,11 +1203,8 @@ def _fix_table_quotes_v2(dax: str) -> str:
     # 3. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
     dax = re.sub(r"'([^']+)\[([^\]]+)\]'", r"'\1'[\2]", dax)
 
-    # 4. Corregir condiciones con comillas anidadas: 'Tab' = "Val" && 'Tab'
-    # Patrón: palabra seguida de comilla simple sin espacio antes
-    dax = re.sub(r"(\w)'(\w)", r"\1 \2", dax)
-
-    # 5. Corregir: Tabla[Columna] → 'Tabla'[Columna] (solo si no es función DAX)
+    # 4. Corregir: Tabla[Columna] → 'Tabla'[Columna] (solo si no es función DAX)
+    # NOTA: Este paso va ANTES de la corrección de condiciones para no romper las referencias
     funciones_dax = ["SUM", "COUNT", "AVERAGE", "MIN", "MAX", "COUNTROWS", "CALCULATE",
                      "SUMX", "FILTER", "ALL", "VALUES", "DISTINCT", "RELATED", "DATE",
                      "YEAR", "MONTH", "DAY", "TODAY", "NOW", "ROW", "SUMMARIZECOLUMNS",
