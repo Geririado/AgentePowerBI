@@ -408,6 +408,11 @@ REGLAS CRÍTICAS DE SINTAXIS:
 10. Para agregaciones por persona/empleado:
     - Primero busca en tablas "DIM" o tablas que tengan "User", "Empleado", "RRHH"
     - Usa columnas descriptivas (nombre completo, apellidos) NO IDs
+11. IMPORTANTE - Filtros geográficos (ciudades, provincias, comunidades):
+    - Si preguntan por "Madrid", "Barcelona", etc. → Busca columnas con "ciudad", "provincia", "localidad", "nombre", "modalidad"
+    - NUNCA uses columnas con "id", "codigo", "key" para filtrar por nombres de ciudades
+    - Ejemplo CORRECTO: 'Dim_cursosdeaccion'[NombreSimple] = "Madrid"
+    - Ejemplo INCORRECTO: 'Dim_cursosdeaccion'[idaccioncur] = 28024
 
 Ejemplos de metric_expression correctos:
 - [Total Vacaciones]  (si existe la medida)
@@ -1494,7 +1499,38 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
         
         # 4️⃣ Ejecutar query principal
         df_principal = _ejecutar_dax(dax_query, dataset_name)
-        
+
+        # 🔁 SISTEMA DE RETRY: Si devuelve 0 resultados, intentar estrategias alternativas
+        if df_principal.empty and params.get("filters"):
+            print("⚠️ Query devolvió 0 resultados. Intentando estrategias alternativas...")
+
+            # Estrategia 1: Intentar sin filtros para verificar si hay datos
+            params_sin_filtros = params.copy()
+            params_sin_filtros["filters"] = []
+            dax_sin_filtros = _build_dax_from_pattern(pattern, params_sin_filtros)
+
+            try:
+                df_test = _ejecutar_dax(dax_sin_filtros, dataset_name)
+                if not df_test.empty:
+                    print(f"✅ Datos encontrados sin filtros ({len(df_test)} filas). El filtro aplicado puede ser incorrecto.")
+                    print("🔄 Intentando fallback GPT con contexto de filtros incorrectos...")
+
+                    # Usar fallback GPT con información adicional
+                    fallback_result = _fallback_gpt_pure(user_prompt, ctx)
+                    if fallback_result["method"] != "failed":
+                        return fallback_result
+            except:
+                pass
+
+            # Estrategia 2: Buscar columnas descriptivas en lugar de IDs
+            if any("id" in f["column"].lower() for f in params.get("filters", [])):
+                print("🔄 Filtro usa columnas ID. Buscando columnas descriptivas alternativas...")
+                # Intentar fallback GPT que suele elegir mejores columnas
+                fallback_result = _fallback_gpt_pure(user_prompt, ctx)
+                if fallback_result["method"] != "failed":
+                    df_principal = pd.DataFrame(fallback_result["preview"])
+                    dax_query = fallback_result["query"]
+
         resultados = {
             "principal": {
                 "query": dax_query,
@@ -1502,7 +1538,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
                 "preview": df_principal.head(20).to_dict(orient="records")
             }
         }
-        
+
         # 5️⃣ Generar y ejecutar queries complementarias si es necesario
         if requiere_multi:
             print("🔢 Generando queries complementarias...")
