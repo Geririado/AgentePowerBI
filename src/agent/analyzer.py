@@ -1045,7 +1045,7 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
         # Multi-query: Incluir todas las queries
         contexto_datos = {
             "query_principal": {
-                "datos": df.head(10).to_dict(orient="records"),
+                "datos": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
                 "filas_totales": len(df)
             }
         }
@@ -1056,11 +1056,22 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
                     "descripcion": res.get("descripcion", ""),
                     "datos": res.get("preview", [])
                 }
-        max_tokens = 500
+        max_tokens = 800
     else:
-        # Query simple
-        contexto_datos = df.head(20).to_dict(orient="records")
-        max_tokens = 400
+        # Query simple: Enviar todas las filas si <= 100, sino primeras 50
+        contexto_datos = df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records")
+        max_tokens = 600
+
+    # Preparar nota sobre total de filas si se truncó
+    nota_filas = ""
+    if todos_resultados:
+        total = contexto_datos["query_principal"]["filas_totales"]
+        if total > 50:
+            nota_filas = f"\nNOTA: Se muestran 50 de {total} filas totales."
+    else:
+        total = len(df)
+        if total > 100:
+            nota_filas = f"\nNOTA: Se muestran 50 de {total} filas totales."
 
     prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional.
 
@@ -1069,11 +1080,11 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
 PREGUNTA: "{user_prompt}"
 
 RESULTADOS POWER BI:
-{json.dumps(contexto_datos, ensure_ascii=False, indent=2, default=_to_json_safe)}
+{json.dumps(contexto_datos, ensure_ascii=False, indent=2, default=_to_json_safe)}{nota_filas}
 
 INSTRUCCIONES:
-1. Responde directamente usando los datos
-2. Usa terminología formativa: alumnos, cursos, instructores, finalizaciones
+1. Responde directamente usando TODOS los datos disponibles
+2. Usa terminología formativa: alumnos, cursos, instructors, finalizaciones
 3. Sé preciso con números y porcentajes
 4. Conciso (máx 4-5 líneas)
 
@@ -1262,7 +1273,8 @@ GENERA SOLO EL CÓDIGO DAX sin markdown ni explicaciones:"""
         return {
             "text": text,
             "query": dax_corregido,
-            "preview": df.head(10).to_dict(orient="records"),
+            "preview": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
+            "total_filas": len(df),
             "method": "gpt_fallback"
         }
 
@@ -1460,7 +1472,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
             "principal": {
                 "query": dax_query,
                 "data": df_principal,
-                "preview": df_principal.head(20).to_dict(orient="records")
+                "preview": df_principal.to_dict(orient="records") if len(df_principal) <= 100 else df_principal.head(50).to_dict(orient="records")
             }
         }
 
@@ -1490,7 +1502,8 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
         return {
             "text": text,
             "query": dax_query,
-            "preview": df_principal.head(20).to_dict(orient="records"),
+            "preview": df_principal.to_dict(orient="records") if len(df_principal) <= 100 else df_principal.head(50).to_dict(orient="records"),
+            "total_filas": len(df_principal),
             "pattern_used": pattern_name,
             "parameters": params,
             "method": "pattern_based",
