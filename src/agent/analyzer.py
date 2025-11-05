@@ -1045,7 +1045,7 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
         # Multi-query: Incluir todas las queries
         contexto_datos = {
             "query_principal": {
-                "datos": df.head(10).to_dict(orient="records"),
+                "datos": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
                 "filas_totales": len(df)
             }
         }
@@ -1056,11 +1056,11 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
                     "descripcion": res.get("descripcion", ""),
                     "datos": res.get("preview", [])
                 }
-        max_tokens = 500
+        max_tokens = 800
     else:
-        # Query simple
-        contexto_datos = df.head(20).to_dict(orient="records")
-        max_tokens = 400
+        # Query simple: Enviar todas las filas si <= 100, sino primeras 50
+        contexto_datos = df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records")
+        max_tokens = 600
 
     prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional.
 
