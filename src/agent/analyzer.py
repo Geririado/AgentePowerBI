@@ -1178,12 +1178,12 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
     if df.empty:
         return "La consulta no devolvió resultados."
 
-    # Preparar datos según tipo de query
+    # Preparar datos según tipo de query - SIEMPRE TODOS LOS DATOS
     if todos_resultados:
-        # Multi-query: Incluir todas las queries
+        # Multi-query: Incluir todas las queries COMPLETAS
         contexto_datos = {
             "query_principal": {
-                "datos": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
+                "datos": df.to_dict(orient="records"),  # Todos los datos
                 "filas_totales": len(df)
             }
         }
@@ -1194,22 +1194,11 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
                     "descripcion": res.get("descripcion", ""),
                     "datos": res.get("preview", [])
                 }
-        max_tokens = 800
+        max_tokens = 1500  # Aumentado para soportar más datos
     else:
-        # Query simple: Enviar todas las filas si <= 100, sino primeras 50
-        contexto_datos = df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records")
-        max_tokens = 600
-
-    # Preparar nota sobre total de filas si se truncó
-    nota_filas = ""
-    if todos_resultados:
-        total = contexto_datos["query_principal"]["filas_totales"]
-        if total > 50:
-            nota_filas = f"\nNOTA: Se muestran 50 de {total} filas totales."
-    else:
-        total = len(df)
-        if total > 100:
-            nota_filas = f"\nNOTA: Se muestran 50 de {total} filas totales."
+        # Query simple: Enviar TODAS las filas sin limitación
+        contexto_datos = df.to_dict(orient="records")  # Todos los datos
+        max_tokens = 1000  # Aumentado para soportar más datos
 
     # Obtener fecha actual para contexto
     fecha_actual = _get_fecha_actual()
@@ -1250,7 +1239,7 @@ Respuesta como analista FEMXA:"""
         print(f"⚠️ Error generando resumen: {e}")
         if len(df) == 1 and len(df.columns) == 1:
             return f"El resultado es: {df.iloc[0, 0]}"
-        return f"Se encontraron {len(df)} registros. Preview: {df.head(3).to_dict(orient='records')}"
+        return f"Se encontraron {len(df)} registros. Datos: {df.to_dict(orient='records')}"
 
 
 # ============================================
@@ -1420,7 +1409,7 @@ GENERA SOLO EL CÓDIGO DAX sin markdown ni explicaciones:"""
         return {
             "text": text,
             "query": dax_corregido,
-            "preview": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
+            "preview": df.to_dict(orient="records"),  # Todos los datos sin limitación
             "total_filas": len(df),
             "method": "gpt_fallback"
         }
@@ -1619,7 +1608,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
             "principal": {
                 "query": dax_query,
                 "data": df_principal,
-                "preview": df_principal.to_dict(orient="records") if len(df_principal) <= 100 else df_principal.head(50).to_dict(orient="records")
+                "preview": df_principal.to_dict(orient="records")  # Todos los datos sin limitación
             }
         }
 
@@ -1649,7 +1638,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
         return {
             "text": text,
             "query": dax_query,
-            "preview": df_principal.to_dict(orient="records") if len(df_principal) <= 100 else df_principal.head(50).to_dict(orient="records"),
+            "preview": df_principal.to_dict(orient="records"),  # Todos los datos sin limitación
             "total_filas": len(df_principal),
             "pattern_used": pattern_name,
             "parameters": params,
