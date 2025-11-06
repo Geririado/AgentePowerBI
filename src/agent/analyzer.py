@@ -166,8 +166,23 @@ def _to_json_safe(obj):
     return str(obj)
 
 
-def _open_conn(dataset_name: str) -> AdomdConnection:
-    """Abre conexión a Power BI con ADOMD.NET"""
+def _open_conn(dataset_name: str, max_retries: int = 3) -> AdomdConnection:
+    """
+    Abre conexión a Power BI con ADOMD.NET con reintentos automáticos.
+
+    Args:
+        dataset_name: Nombre del dataset de Power BI
+        max_retries: Número máximo de reintentos en caso de error (default: 3)
+
+    Returns:
+        AdomdConnection: Conexión abierta al dataset
+
+    Raises:
+        ConnectionError: Si no se puede conectar después de todos los reintentos
+        ValueError: Si el dataset_name es inválido
+    """
+    if not dataset_name or dataset_name.strip() == "":
+        raise ValueError("El nombre del dataset no puede estar vacío")
 
     cs = (
         f"Provider=MSOLAP;"
@@ -175,9 +190,37 @@ def _open_conn(dataset_name: str) -> AdomdConnection:
         f"Initial Catalog={dataset_name};"
         f"Integrated Security=ClaimsToken;"
     )
-    conn = AdomdConnection(cs)
-    conn.Open()
-    return conn
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            conn = AdomdConnection(cs)
+            conn.Open()
+            if attempt > 0:
+                print(f"✅ Conexión establecida en intento {attempt + 1}")
+            return conn
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).lower()
+
+            # Errores no recuperables - no reintentar
+            if any(x in error_msg for x in ["401", "403", "no autorizado", "unauthorized", "forbidden"]):
+                raise ConnectionError(f"Error de autenticación al conectar con '{dataset_name}': {e}") from e
+
+            if "not found" in error_msg or "no se encuentra" in error_msg:
+                raise ConnectionError(f"Dataset '{dataset_name}' no encontrado: {e}") from e
+
+            # Errores recuperables - reintentar
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Backoff exponencial: 1s, 2s, 4s
+                print(f"⚠️ Error de conexión (intento {attempt + 1}/{max_retries}). Reintentando en {wait_time}s...")
+                import time
+                time.sleep(wait_time)
+            else:
+                raise ConnectionError(f"No se pudo conectar con '{dataset_name}' después de {max_retries} intentos: {last_error}") from last_error
+
+    # Esta línea nunca debería ejecutarse, pero por si acaso
+    raise ConnectionError(f"Error inesperado al conectar con '{dataset_name}'") from last_error
 
 
 def _dmv_tables(conn) -> dict:
@@ -363,7 +406,13 @@ SUGERENCIAS BASADAS EN EL SCHEMA DEL CM:
 Estas son las columnas más adecuadas detectadas automáticamente. Úsalas a menos que la pregunta requiera explícitamente otras columnas.
 """
     
+    # Obtener fecha actual para contexto temporal
+    fecha_actual = _get_fecha_actual()
+
     prompt_gpt = f"""Eres un experto en modelos de datos de Power BI.
+
+FECHA ACTUAL: {fecha_actual}
+Usa esta fecha para interpretar referencias temporales como "este año", "este mes", "hoy", etc.
 
 PREGUNTA DEL USUARIO:
 "{prompt}"
@@ -967,55 +1016,128 @@ SUMMARIZECOLUMNS(
 # ============================================
 # EJECUCIÓN DE DAX
 # ============================================
-def _ejecutar_dax(dax_query: str, dataset_name: str) -> pd.DataFrame:
-    """Ejecuta query DAX y devuelve DataFrame"""
-    
-    # ✅ Validación básica antes de ejecutar
+def _ejecutar_dax(dax_query: str, dataset_name: str, timeout: int = 60) -> pd.DataFrame:
+    """
+    Ejecuta query DAX y devuelve DataFrame con manejo robusto de errores.
+
+    Args:
+        dax_query: Query DAX a ejecutar (debe comenzar con EVALUATE)
+        dataset_name: Nombre del dataset de Power BI
+        timeout: Timeout en segundos para la query (default: 60)
+
+    Returns:
+        pd.DataFrame: Resultado de la query
+
+    Raises:
+        ValueError: Si la query no es válida
+        ConnectionError: Si hay problemas de conexión
+        RuntimeError: Si la query falla por problemas de sintaxis o datos
+    """
+
+    # ✅ Validaciones básicas
+    if not dax_query or not dax_query.strip():
+        raise ValueError("La query DAX no puede estar vacía")
+
     if not dax_query.strip().upper().startswith("EVALUATE"):
         raise ValueError("La query DAX debe comenzar con EVALUATE")
-    
-    connection_string = (
-        f"Provider=MSOLAP;"
-        f"Data Source={WORKSPACE_URL};"
-        f"Initial Catalog={dataset_name};"
-        f"Integrated Security=ClaimsToken;"
-    )
-    
-    print(f"\n🔧 Ejecutando query DAX:\n{dax_query}\n")
-    
+
+    if not dataset_name or not dataset_name.strip():
+        raise ValueError("El nombre del dataset no puede estar vacío")
+
+    print(f"\n🔧 Ejecutando query DAX:\n{dax_query[:500]}{'...' if len(dax_query) > 500 else ''}\n")
+
+    conn = None
+    reader = None
+
     try:
-        conn = AdomdConnection(connection_string)
-        conn.Open()
+        # Usar la función mejorada de conexión con reintentos
+        conn = _open_conn(dataset_name)
 
         cmd = AdomdCommand(dax_query, conn)
+
+        # Configurar timeout si es posible
+        try:
+            cmd.CommandTimeout = timeout
+        except:
+            pass  # Algunos proveedores no soportan CommandTimeout
+
         reader = cmd.ExecuteReader()
-        
+
+        # Extraer columnas
         cols = [reader.GetName(i) for i in range(reader.FieldCount)]
+
+        # Extraer filas
         rows = []
-        while reader.Read():
+        row_count = 0
+        max_rows = 100000  # Límite de seguridad
+
+        while reader.Read() and row_count < max_rows:
             rows.append([reader.GetValue(i) for i in range(reader.FieldCount)])
-        
-        conn.Close()
+            row_count += 1
+
+        if row_count >= max_rows:
+            print(f"⚠️ Advertencia: Se alcanzó el límite de {max_rows} filas. Puede haber más datos.")
 
         df = pd.DataFrame(rows, columns=cols)
-        print(f"✅ Query ejecutada: {len(df)} filas devueltas")
+        print(f"✅ Query ejecutada exitosamente: {len(df)} filas devueltas")
         return df
-        
+
+    except ConnectionError as e:
+        # Ya manejado por _open_conn, solo re-lanzar
+        print(f"❌ Error de conexión: {e}")
+        raise
+
+    except ValueError as e:
+        # Error de validación
+        print(f"❌ Error de validación: {e}")
+        raise
+
     except Exception as e:
         error_msg = str(e)
-        
-        # Detectar errores comunes y sugerir soluciones
-        if "No se encuentra la tabla" in error_msg:
+
+        # Detectar y reportar errores comunes de DAX
+        if "no se encuentra la tabla" in error_msg.lower() or "table" in error_msg.lower() and "not found" in error_msg.lower():
             print(f"❌ Error: Tabla no encontrada en el modelo")
             print(f"💡 Sugerencia: Verifica que el nombre de la tabla existe y usa comillas simples: 'NombreTabla'")
-        elif "No se encuentra la columna" in error_msg:
+            raise RuntimeError(f"Tabla no encontrada en el modelo: {error_msg}") from e
+
+        elif "no se encuentra la columna" in error_msg.lower() or "column" in error_msg.lower() and "not found" in error_msg.lower():
             print(f"❌ Error: Columna no encontrada")
             print(f"💡 Sugerencia: Verifica el nombre exacto de la columna en el modelo")
-        elif "no puede utilizarse en esta expresión" in error_msg:
+            raise RuntimeError(f"Columna no encontrada: {error_msg}") from e
+
+        elif "no puede utilizarse" in error_msg.lower() or "cannot be used" in error_msg.lower():
             print(f"❌ Error: Tipo de dato incompatible")
-            print(f"💡 Sugerencia: No se puede hacer SUM() de fechas o textos")
-        
-        raise e
+            print(f"💡 Sugerencia: No se puede hacer SUM() de fechas o textos, COUNT() es más apropiado")
+            raise RuntimeError(f"Tipo de dato incompatible: {error_msg}") from e
+
+        elif "sintaxis" in error_msg.lower() or "syntax" in error_msg.lower():
+            print(f"❌ Error de sintaxis DAX")
+            print(f"💡 Sugerencia: Revisa las comillas y paréntesis en la query")
+            raise RuntimeError(f"Error de sintaxis DAX: {error_msg}") from e
+
+        elif "timeout" in error_msg.lower() or "tiempo de espera" in error_msg.lower():
+            print(f"❌ Error: Timeout ejecutando la query")
+            print(f"💡 Sugerencia: La query es demasiado compleja o los datos son muy grandes. Intenta filtrar más.")
+            raise RuntimeError(f"Timeout en query DAX: {error_msg}") from e
+
+        # Error genérico
+        print(f"❌ Error ejecutando query DAX: {error_msg}")
+        raise RuntimeError(f"Error ejecutando query DAX: {error_msg}") from e
+
+    finally:
+        # Limpiar recursos
+        try:
+            if reader is not None:
+                reader.Close()
+        except:
+            pass
+
+        try:
+            if conn is not None:
+                conn.Close()
+        except:
+            pass
 
 
 # ============================================
@@ -1025,12 +1147,28 @@ def _ejecutar_dax(dax_query: str, dataset_name: str) -> pd.DataFrame:
 _FEMXA_SYSTEM_MSG = """Eres un analista de datos de FEMXA, empresa de formación profesional.
 Interpretas datos académicos, de RRHH y operativos.
 Comunicas resultados con precisión usando terminología educativa.
-Eres profesional, claro y orientado a insights accionables."""
+Eres profesional, claro y orientado a insights accionables.
+
+FECHA ACTUAL: {fecha_actual}
+Siempre ten en cuenta esta fecha para interpretar consultas temporales (hoy, esta semana, este mes, este año, etc.)"""
 
 _FEMXA_CONTEXT = """CONTEXTO EMPRESARIAL:
 - FEMXA gestiona programas formativos, cursos profesionales y capacitación
 - Datos típicos: alumnos, instructores, cursos, asistencias, calificaciones, vacaciones, horas lectivas
-- Tu audiencia son gestores, coordinadores académicos y responsables de RRHH"""
+- Tu audiencia son gestores, coordinadores académicos y responsables de RRHH
+- Fecha de hoy: {fecha_actual}"""
+
+def _get_fecha_actual() -> str:
+    """Obtiene la fecha actual formateada para el contexto del agente"""
+    now = datetime.datetime.now()
+    dias_semana = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+    dia_semana = dias_semana[now.weekday()]
+    mes = meses[now.month - 1]
+
+    return f"{dia_semana} {now.day} de {mes} de {now.year}"
 
 def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dict = None) -> str:
     """
@@ -1040,12 +1178,12 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
     if df.empty:
         return "La consulta no devolvió resultados."
 
-    # Preparar datos según tipo de query
+    # Preparar datos según tipo de query - SIEMPRE TODOS LOS DATOS
     if todos_resultados:
-        # Multi-query: Incluir todas las queries
+        # Multi-query: Incluir todas las queries COMPLETAS
         contexto_datos = {
             "query_principal": {
-                "datos": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
+                "datos": df.to_dict(orient="records"),  # Todos los datos
                 "filas_totales": len(df)
             }
         }
@@ -1056,26 +1194,18 @@ def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dic
                     "descripcion": res.get("descripcion", ""),
                     "datos": res.get("preview", [])
                 }
-        max_tokens = 800
+        max_tokens = 1500  # Aumentado para soportar más datos
     else:
-        # Query simple: Enviar todas las filas si <= 100, sino primeras 50
-        contexto_datos = df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records")
-        max_tokens = 600
+        # Query simple: Enviar TODAS las filas sin limitación
+        contexto_datos = df.to_dict(orient="records")  # Todos los datos
+        max_tokens = 1000  # Aumentado para soportar más datos
 
-    # Preparar nota sobre total de filas si se truncó
-    nota_filas = ""
-    if todos_resultados:
-        total = contexto_datos["query_principal"]["filas_totales"]
-        if total > 50:
-            nota_filas = f"\nNOTA: Se muestran 50 de {total} filas totales."
-    else:
-        total = len(df)
-        if total > 100:
-            nota_filas = f"\nNOTA: Se muestran 50 de {total} filas totales."
+    # Obtener fecha actual para contexto
+    fecha_actual = _get_fecha_actual()
 
     prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional.
 
-{_FEMXA_CONTEXT}
+{_FEMXA_CONTEXT.format(fecha_actual=fecha_actual)}
 
 PREGUNTA: "{user_prompt}"
 
@@ -1100,7 +1230,7 @@ Respuesta como analista FEMXA:"""
             temperature=0.3,
             max_tokens=max_tokens,
             messages=[
-                {"role": "system", "content": _FEMXA_SYSTEM_MSG},
+                {"role": "system", "content": _FEMXA_SYSTEM_MSG.format(fecha_actual=fecha_actual)},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -1109,7 +1239,7 @@ Respuesta como analista FEMXA:"""
         print(f"⚠️ Error generando resumen: {e}")
         if len(df) == 1 and len(df.columns) == 1:
             return f"El resultado es: {df.iloc[0, 0]}"
-        return f"Se encontraron {len(df)} registros. Preview: {df.head(3).to_dict(orient='records')}"
+        return f"Se encontraron {len(df)} registros. Datos: {df.to_dict(orient='records')}"
 
 
 # ============================================
@@ -1185,7 +1315,13 @@ def _fallback_gpt_pure(prompt: str, ctx: dict) -> dict:
             "filas": len(t.get("muestra", []))
         })
 
+    # Obtener fecha actual para contexto temporal
+    fecha_actual = _get_fecha_actual()
+
     prompt_gpt = f"""Eres un experto en Power BI DAX. Genera queries VÁLIDAS y EJECUTABLES.
+
+FECHA ACTUAL: {fecha_actual}
+Usa esta fecha para interpretar referencias temporales en la pregunta.
 
 PREGUNTA DEL USUARIO:
 {prompt}
@@ -1273,7 +1409,7 @@ GENERA SOLO EL CÓDIGO DAX sin markdown ni explicaciones:"""
         return {
             "text": text,
             "query": dax_corregido,
-            "preview": df.to_dict(orient="records") if len(df) <= 100 else df.head(50).to_dict(orient="records"),
+            "preview": df.to_dict(orient="records"),  # Todos los datos sin limitación
             "total_filas": len(df),
             "method": "gpt_fallback"
         }
@@ -1472,7 +1608,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
             "principal": {
                 "query": dax_query,
                 "data": df_principal,
-                "preview": df_principal.to_dict(orient="records") if len(df_principal) <= 100 else df_principal.head(50).to_dict(orient="records")
+                "preview": df_principal.to_dict(orient="records")  # Todos los datos sin limitación
             }
         }
 
@@ -1502,7 +1638,7 @@ def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict
         return {
             "text": text,
             "query": dax_query,
-            "preview": df_principal.to_dict(orient="records") if len(df_principal) <= 100 else df_principal.head(50).to_dict(orient="records"),
+            "preview": df_principal.to_dict(orient="records"),  # Todos los datos sin limitación
             "total_filas": len(df_principal),
             "pattern_used": pattern_name,
             "parameters": params,
