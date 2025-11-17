@@ -17,28 +17,20 @@ load_dotenv()
 
 print("🔍 Intentando cargar schemas...")
 
-# Importar schemas generados
 try:
-    import sys
     from pathlib import Path
-    # Añadir el directorio actual al path si no está
     current_dir = Path(__file__).parent if '__file__' in globals() else Path.cwd()
     if str(current_dir) not in sys.path:
         sys.path.insert(0, str(current_dir))
     
-    print(f"📁 Buscando schemas en: {current_dir}")
-    
     from schemas import get_schema, get_columna_nombre_persona, get_metrica_principal, SCHEMAS
     SCHEMAS_DISPONIBLES = True
-    print(f"✅ Schemas cargados correctamente: {len(SCHEMAS)} CMs disponibles")
+    print(f"✅ Schemas cargados: {len(SCHEMAS)} CMs disponibles")
 except ImportError as e:
     print(f"⚠️ schemas.py no encontrado: {e}")
-    print(f"   Buscando en: {sys.path}")
     SCHEMAS_DISPONIBLES = False
 except Exception as e:
     print(f"⚠️ Error cargando schemas: {e}")
-    import traceback
-    traceback.print_exc()
     SCHEMAS_DISPONIBLES = False
 
 openai.api_type = "azure"
@@ -55,29 +47,6 @@ os.environ["PATH"] += os.pathsep + str(dll_path)
 sys.path.append(str(dll_path))
 dll_file = dll_path / "Microsoft.AnalysisServices.AdomdClient.dll"
 clr.AddReference(str(dll_file))
-
-# ============================================
-# CONSTANTES DE CONTEXTO FEMXA
-# ============================================
-FEMXA_CONTEXT = {
-    "empresa": "FEMXA",
-    "sector": "Formación profesional y capacitación",
-    "actividades": [
-        "Cursos de formación profesional",
-        "Programas de capacitación",
-        "Gestión de alumnos e instructores",
-        "Seguimiento de asistencias y calificaciones",
-        "Gestión de recursos humanos",
-        "Control de vacaciones y horas lectivas"
-    ],
-    "terminologia": {
-        "alumnos": ["estudiantes", "participantes", "matriculados"],
-        "cursos": ["programas formativos", "acciones formativas", "módulos"],
-        "instructores": ["docentes", "formadores", "profesorado"],
-        "personal": ["empleados", "equipo", "plantilla"]
-    }
-}
-
 
 # ============================================
 # PATRONES DAX PRE-CONSTRUIDOS
@@ -128,17 +97,6 @@ ROW(
         "required": ["table"]
     },
     
-    "conteo_con_filtro": {
-        "template": """EVALUATE
-ROW(
-    "Total", CALCULATE(
-        COUNTROWS('{table}'){filters}
-    )
-)""",
-        "keywords": ["cuántos", "número de", "total"],
-        "required": ["table"]
-    },
-    
     "valor_unico": {
         "template": """EVALUATE
 ROW(
@@ -149,10 +107,57 @@ ROW(
     }
 }
 
-
 # ============================================
-# UTILIDADES DE CONEXIÓN
+# DETECCIÓN INTELIGENTE DE COLUMNAS
 # ============================================
+def _detectar_columna_nombre_persona(ctx: dict) -> tuple[str, str] | None:
+    """Detecta automáticamente la columna correcta para nombres de persona"""
+    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
+    
+    # Prioridad de tablas
+    prioridad_tablas = [
+        "DIM_Responsable", 
+        "DIM_Persona",
+        "DIM_Empleado",
+        "stg RRHH_Users", 
+        "stg GEN_DptoRRHH"
+    ]
+    
+    # Palabras clave para identificar columnas de nombre
+    keywords_nombre = ["nombre", "name", "apellido", "completo", "full"]
+    
+    for tabla_name in prioridad_tablas:
+        tabla = next((t for t in ctx_filtrado if t["nombre"] == tabla_name), None)
+        if not tabla or not tabla.get("muestra"):
+            continue
+        
+        for col, val in tabla["muestra"][0].items():
+            col_lower = col.lower()
+            
+            # Debe ser string y contener keywords
+            if isinstance(val, str) and any(kw in col_lower for kw in keywords_nombre):
+                # NO debe ser ID o key
+                if not any(k in col_lower for k in ["id", "key", "codigo", "code"]):
+                    # Validar que tenga valores con espacios (nombre completo)
+                    if " " in str(val):
+                        print(f"🎯 Columna nombre detectada: '{tabla_name}'[{col}] = '{val}'")
+                        return (tabla_name, col)
+    
+    # Buscar en todas las tablas si no se encontró en prioritarias
+    for tabla in ctx_filtrado:
+        if not tabla.get("muestra"):
+            continue
+        
+        for col, val in tabla["muestra"][0].items():
+            col_lower = col.lower()
+            
+            if isinstance(val, str) and any(kw in col_lower for kw in keywords_nombre):
+                if not any(k in col_lower for k in ["id", "key", "codigo"]):
+                    if " " in str(val):
+                        print(f"🎯 Columna nombre detectada (secundaria): '{tabla['nombre']}'[{col}] = '{val}'")
+                        return (tabla["nombre"], col)
+    
+    return None
 def _to_json_safe(obj):
     """Convierte objetos Python a tipos serializables en JSON"""
     if isinstance(obj, (datetime.datetime, datetime.date)):
@@ -166,110 +171,34 @@ def _to_json_safe(obj):
     return str(obj)
 
 
-def _open_conn(dataset_name: str, max_retries: int = 3) -> AdomdConnection:
-    """
-    Abre conexión a Power BI con ADOMD.NET con reintentos automáticos.
-
-    Args:
-        dataset_name: Nombre del dataset de Power BI
-        max_retries: Número máximo de reintentos en caso de error (default: 3)
-
-    Returns:
-        AdomdConnection: Conexión abierta al dataset
-
-    Raises:
-        ConnectionError: Si no se puede conectar después de todos los reintentos
-        ValueError: Si el dataset_name es inválido
-    """
-    if not dataset_name or dataset_name.strip() == "":
-        raise ValueError("El nombre del dataset no puede estar vacío")
-
+def _open_conn(dataset_name: str) -> AdomdConnection:
+    """Abre conexión a Power BI con ADOMD.NET"""
     cs = (
         f"Provider=MSOLAP;"
         f"Data Source={WORKSPACE_URL};"
         f"Initial Catalog={dataset_name};"
         f"Integrated Security=ClaimsToken;"
     )
-
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            conn = AdomdConnection(cs)
-            conn.Open()
-            if attempt > 0:
-                print(f"✅ Conexión establecida en intento {attempt + 1}")
-            return conn
-        except Exception as e:
-            last_error = e
-            error_msg = str(e).lower()
-
-            # Errores no recuperables - no reintentar
-            if any(x in error_msg for x in ["401", "403", "no autorizado", "unauthorized", "forbidden"]):
-                raise ConnectionError(f"Error de autenticación al conectar con '{dataset_name}': {e}") from e
-
-            if "not found" in error_msg or "no se encuentra" in error_msg:
-                raise ConnectionError(f"Dataset '{dataset_name}' no encontrado: {e}") from e
-
-            # Errores recuperables - reintentar
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # Backoff exponencial: 1s, 2s, 4s
-                print(f"⚠️ Error de conexión (intento {attempt + 1}/{max_retries}). Reintentando en {wait_time}s...")
-                import time
-                time.sleep(wait_time)
-            else:
-                raise ConnectionError(f"No se pudo conectar con '{dataset_name}' después de {max_retries} intentos: {last_error}") from last_error
-
-    # Esta línea nunca debería ejecutarse, pero por si acaso
-    raise ConnectionError(f"Error inesperado al conectar con '{dataset_name}'") from last_error
+    conn = AdomdConnection(cs)
+    conn.Open()
+    return conn
 
 
-def _dmv_tables(conn) -> dict:
-    """Obtiene mapeo de IDs a nombres de tablas"""
-    q = "SELECT [ID],[Name] FROM $SYSTEM.TMSCHEMA_TABLES"
-    r = AdomdCommand(q, conn).ExecuteReader()
-    mapping = {}
-    while r.Read():
-        mapping[str(r.GetValue(0))] = r.GetValue(1)
-    r.Close()
-    return mapping
+def _filtrar_tablas_irrelevantes(contexto: list[dict]) -> list[dict]:
+    """Filtra tablas autogeneradas por Power BI"""
+    tablas_filtradas = []
+    for t in contexto:
+        nombre = t.get("nombre", "")
+        if nombre.startswith("LocalDateTable_") or \
+           nombre.startswith("DateTableTemplate_") or \
+           nombre == "_Medidas" or nombre == "_medidas":
+            continue
+        tablas_filtradas.append(t)
+    return tablas_filtradas
 
 
-def _dmv_columns(conn, tables_map) -> list[dict]:
-    """Obtiene todas las columnas del modelo con sus tipos"""
-    q = "SELECT [TableID],[Name],[DataType] FROM $SYSTEM.TMSCHEMA_COLUMNS"
-    r = AdomdCommand(q, conn).ExecuteReader()
-    cols = []
-    while r.Read():
-        table_id = str(r.GetValue(0))
-        cols.append({
-            "tabla": tables_map.get(table_id, ""),
-            "columna": r.GetValue(1),
-            "tipo": str(r.GetValue(2)).lower()
-        })
-    r.Close()
-    return cols
-
-
-def _dmv_measures(conn, tables_map) -> list[dict]:
-    """Obtiene todas las medidas del modelo"""
-    q = "SELECT [TableID],[Name],[Expression] FROM $SYSTEM.TMSCHEMA_MEASURES"
-    r = AdomdCommand(q, conn).ExecuteReader()
-    measures = []
-    while r.Read():
-        measures.append({
-            "tabla": tables_map.get(str(r.GetValue(0)), ""),
-            "measure": r.GetValue(1),
-            "expr": r.GetValue(2)
-        })
-    r.Close()
-    return measures
-
-
-# ============================================
-# SELECCIÓN DE PATRÓN DAX
-# ============================================
 def _select_pattern(prompt: str) -> tuple[str, dict]:
-    """Selecciona el patrón DAX más adecuado según la pregunta"""
+    """Selecciona el patrón DAX más adecuado"""
     prompt_lower = prompt.lower()
     
     scores = {}
@@ -277,257 +206,27 @@ def _select_pattern(prompt: str) -> tuple[str, dict]:
         score = sum(1 for kw in pattern_info["keywords"] if kw in prompt_lower)
         scores[pattern_name] = score
     
-    # Si hay un claro ganador
     best_pattern = max(scores, key=scores.get)
     if scores[best_pattern] > 0:
         return best_pattern, DAX_PATTERNS[best_pattern]
     
-    # Fallback: heurística simple
     if any(w in prompt_lower for w in ["cuántos hay", "número total"]):
         return "conteo_simple", DAX_PATTERNS["conteo_simple"]
     
     return "agregacion_simple", DAX_PATTERNS["agregacion_simple"]
 
 
-# ============================================
-# FILTRADO DE TABLAS IRRELEVANTES
-# ============================================
-def _filtrar_tablas_irrelevantes(contexto: list[dict]) -> list[dict]:
-    """
-    Filtra tablas generadas automáticamente por Power BI que no aportan valor al análisis
-    """
-    tablas_filtradas = []
-    for t in contexto:
-        nombre = t.get("nombre", "")
-        # Excluir tablas autogeneradas por Power BI
-        if nombre.startswith("LocalDateTable_") or \
-           nombre.startswith("DateTableTemplate_") or \
-           nombre == "_Medidas" or \
-           nombre == "_medidas":
-            continue
-        tablas_filtradas.append(t)
-
-    print(f"📊 Tablas filtradas: {len(contexto)} → {len(tablas_filtradas)} (eliminadas {len(contexto) - len(tablas_filtradas)} tablas irrelevantes)")
-    return tablas_filtradas
-
-
-# ============================================
-# EXTRACCIÓN DE PARÁMETROS CON GPT
-# ============================================
-def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict:
-    """
-    GPT identifica QUÉ componentes usar (tablas, columnas, medidas)
-    pero NO genera código DAX directamente
-    """
-
-    dataset_name = ctx.get("cm_seleccionado", "")
-
-    # 🆕 FILTRAR TABLAS IRRELEVANTES DEL CONTEXTO
-    ctx_filtrado = ctx.copy()
-    ctx_filtrado["contexto"] = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
-
-    # 🆕 USAR SCHEMAS SI ESTÁN DISPONIBLES
-    usar_schema = SCHEMAS_DISPONIBLES and dataset_name
-    dimension_sugerida = None
-    metrica_sugerida = None
-
-    if usar_schema:
-        schema = get_schema(dataset_name)
-        if schema:
-            # Obtener columna de nombre de persona del schema
-            persona_info = get_columna_nombre_persona(dataset_name)
-            if persona_info:
-                tabla_persona, col_persona = persona_info
-                dimension_sugerida = f"'{tabla_persona}'[{col_persona}]"
-                print(f"📌 Schema sugiere dimensión: {dimension_sugerida}")
-
-            # Obtener métrica principal del schema
-            metrica_info = get_metrica_principal(dataset_name)
-            if metrica_info:
-                tabla_metrica, col_metrica = metrica_info
-                metrica_sugerida = f"SUM('{tabla_metrica}'[{col_metrica}])"
-                print(f"📌 Schema sugiere métrica: {metrica_sugerida}")
-
-    # Preparar contexto simplificado CON NOMBRES REALES DE COLUMNAS
-    tablas_disponibles = []
-    for t in ctx_filtrado["contexto"]:
-        if not t.get("muestra") or len(t["muestra"]) == 0:
-            continue
-
-        # Obtener nombres reales de columnas y un ejemplo de valor
-        cols_con_ejemplo = []
-        for col_name, col_value in t["muestra"][0].items():
-            ejemplo = str(col_value)[:50] if col_value is not None else "null"
-            cols_con_ejemplo.append({
-                "nombre": col_name,
-                "ejemplo": ejemplo,
-                "tipo": type(col_value).__name__
-            })
-
-        tablas_disponibles.append({
-            "nombre": t["nombre"],
-            "columnas": cols_con_ejemplo[:15],  # Limitar a 15 columnas
-            "tipo": "fact" if "fact" in t["nombre"].lower() else "dimension"
-        })
-    
-    # Obtener medidas del modelo (capturar errores silenciosamente)
-    medidas_disponibles = []
-    try:
-        conn = _open_conn(ctx["cm_seleccionado"])
-        try:
-            tmap = _dmv_tables(conn)
-            measures = _dmv_measures(conn, tmap)
-            medidas_disponibles = [
-                {"tabla": m['tabla'], "medida": m['measure']}
-                for m in measures
-            ]
-        finally:
-            conn.Close()
-    except Exception as e:
-        # Error 401 u otros problemas de autenticación no deben interrumpir el flujo
-        error_msg = str(e)
-        if "401" in error_msg or "No autorizado" in error_msg:
-            print(f"⚠️ No se pudo acceder a medidas (problema de autenticación). Continuando sin medidas del modelo.")
-        else:
-            print(f"⚠️ No se pudieron obtener medidas: {e}")
-    
-    # 🆕 AÑADIR SUGERENCIAS DEL SCHEMA AL PROMPT
-    sugerencias_schema = ""
-    if usar_schema and (dimension_sugerida or metrica_sugerida):
-        sugerencias_schema = f"""
-
-SUGERENCIAS BASADAS EN EL SCHEMA DEL CM:
-"""
-        if dimension_sugerida:
-            sugerencias_schema += f"- Para agrupar por persona, usa: {dimension_sugerida}\n"
-        if metrica_sugerida:
-            sugerencias_schema += f"- Para la métrica principal, usa: {metrica_sugerida}\n"
-        sugerencias_schema += """
-Estas son las columnas más adecuadas detectadas automáticamente. Úsalas a menos que la pregunta requiera explícitamente otras columnas.
-"""
-    
-    # Obtener fecha actual para contexto temporal
-    fecha_actual = _get_fecha_actual()
-
-    prompt_gpt = f"""Eres un experto en modelos de datos de Power BI.
-
-FECHA ACTUAL: {fecha_actual}
-Usa esta fecha para interpretar referencias temporales como "este año", "este mes", "hoy", etc.
-
-PREGUNTA DEL USUARIO:
-"{prompt}"
-
-TABLAS DISPONIBLES:
-{json.dumps(tablas_disponibles, indent=2, ensure_ascii=False)}
-
-MEDIDAS DISPONIBLES:
-{json.dumps(medidas_disponibles, indent=2, ensure_ascii=False)}
-{sugerencias_schema}
-PATRÓN DE QUERY SELECCIONADO: {pattern_name}
-
-Tu tarea es SOLO identificar los componentes necesarios. NO generes código DAX.
-
-Tu tarea es SOLO identificar los componentes necesarios. NO generes código DAX.
-
-Responde en JSON con este formato exacto:
-{{
-    "tabla_principal": "nombre de la tabla fact o dimension principal",
-    "dimension_columns": ["'NombreTabla'[NombreColumna]"],
-    "metric_expression": "SUM('NombreTabla'[NombreColumna])" o "[NombreMedida]",
-    "metric_name": "Nombre descriptivo para el resultado",
-    "filters": [
-        {{"column": "'Tabla'[Columna]", "operator": "=", "value": 2024}}
-    ],
-    "n": 10
-}}
-
-REGLAS CRÍTICAS DE SINTAXIS:
-1. USA EXACTAMENTE los nombres de columna que aparecen en el JSON de tablas disponibles. NO inventes nombres.
-2. SINTAXIS CORRECTA: SUM('Tabla'[Columna]) ← comillas simples solo alrededor del nombre de tabla
-3. SINTAXIS INCORRECTA: SUM('Tabla[Columna]') ← NO hagas esto
-4. Las medidas no llevan comillas: [NombreMedida]
-5. Para dimension_columns: "'Tabla'[Columna]" ← nota las comillas
-6. Si preguntan por "empleado", "persona" o "nombre": 
-   - NUNCA uses columnas con "Id", "ID", "Key" en el nombre
-   - Busca columnas que contengan "nombre", "name", "user", "usuario", "apellido"
-   - Prioriza columnas descriptivas sobre identificadores numéricos
-7. Si mencionan año/mes/fecha, añade filtros apropiados
-8. Para TOP N, identifica la columna de agrupación y el top number
-9. VERIFICA que la columna existe en el JSON antes de usarla
-10. Para agregaciones por persona/empleado:
-    - Primero busca en tablas "DIM" o tablas que tengan "User", "Empleado", "RRHH"
-    - Usa columnas descriptivas (nombre completo, apellidos) NO IDs
-11. IMPORTANTE - Filtros geográficos (ciudades, provincias, comunidades):
-    - Si preguntan por "Madrid", "Barcelona", etc. → Busca columnas con "ciudad", "provincia", "localidad", "nombre", "modalidad"
-    - NUNCA uses columnas con "id", "codigo", "key" para filtrar por nombres de ciudades
-    - Ejemplo CORRECTO: 'Dim_cursosdeaccion'[NombreSimple] = "Madrid"
-    - Ejemplo INCORRECTO: 'Dim_cursosdeaccion'[idaccioncur] = 28024
-
-Ejemplos de metric_expression correctos:
-- [Total Vacaciones]  (si existe la medida)
-- SUM('FactVacaciones'[Dias])
-- COUNT('FactHoras'[IdRegistro])
-- AVERAGE('FactSalarios'[Importe])
-
-Analiza y responde SOLO el JSON:"""
-    
-    try:
-        response = openai.ChatCompletion.create(
-            engine=DEPLOYMENT_GPT4O,
-            temperature=0,
-            max_tokens=1000,
-            messages=[
-                {"role": "system", "content": "Eres un experto en esquemas de datos. Respondes SOLO JSON válido sin explicaciones."},
-                {"role": "user", "content": prompt_gpt}
-            ]
-        )
-        
-        text = response["choices"][0]["message"]["content"].strip()
-        
-        # Extraer JSON del texto (puede venir con markdown)
-        text = re.sub(r'```json\n?|```\n?', '', text)
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            params = json.loads(match.group(0))
-        else:
-            params = json.loads(text)
-        
-        # Validaciones básicas
-        params.setdefault("dimension_columns", [])
-        params.setdefault("metric_name", "Resultado")
-        params.setdefault("filters", [])
-        params.setdefault("n", 10)
-        
-        # ✅ VALIDAR QUE LAS COLUMNAS EXISTEN EN EL CONTEXTO
-        params = _validate_columns(params, ctx)
-        
-        print(f"✅ Parámetros extraídos: {json.dumps(params, indent=2, ensure_ascii=False)}")
-        return params
-        
-    except Exception as e:
-        print(f"❌ Error extrayendo parámetros con GPT: {e}")
-        return _fallback_parameters(prompt, ctx)
-
-
 def _corregir_sintaxis_referencia(ref: str) -> str:
-    """
-    Corrige sintaxis de referencia DAX.
-
-    Formatos incorrectos:
-    - 'Tabla[Columna]'  → 'Tabla'[Columna]
-    - Tabla[Columna]    → 'Tabla'[Columna]
-    - 'Tabla'[Tabla[Columna]] → 'Tabla'[Columna]
-    """
-    # 1. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
+    """Corrige sintaxis de referencia DAX a formato 'Tabla'[Columna]"""
+    # 'Tabla[Columna]' → 'Tabla'[Columna]
     match_incorrecto = re.match(r"'([^']+)\[([^\]]+)\]'", ref)
     if match_incorrecto:
         tabla, columna = match_incorrecto.groups()
-        # Limpiar columna si tiene duplicación
         if "[" in columna:
             columna = columna.split("[")[-1].rstrip("]")
         return f"'{tabla}'[{columna}]"
 
-    # 2. Corregir: Tabla[Columna] → 'Tabla'[Columna] (sin comillas)
+    # Tabla[Columna] → 'Tabla'[Columna]
     match_sin_comillas = re.match(r"^([A-Za-z_][A-Za-z0-9_\s]*)\[([^\]]+)\]$", ref)
     if match_sin_comillas and "'" not in ref:
         tabla, columna = match_sin_comillas.groups()
@@ -536,122 +235,146 @@ def _corregir_sintaxis_referencia(ref: str) -> str:
             columna = columna.split("[")[-1].rstrip("]")
         return f"'{tabla}'[{columna}]"
 
-    # 3. Ya tiene formato correcto: 'Tabla'[Columna]
+    # Ya correcto: 'Tabla'[Columna]
     match_correcto = re.match(r"'([^']+)'\[([^\]]+)\]", ref)
     if match_correcto:
         tabla, columna = match_correcto.groups()
-        # Limpiar si hay duplicación de tabla en columna
         if "[" in columna:
             columna = columna.split("[")[-1].rstrip("]")
             return f"'{tabla}'[{columna}]"
         return ref
 
-    # 4. No pudo parsear, devolver original
     return ref
 
 
+def _find_similar_column(target: str, available_cols: list) -> str | None:
+    """Busca columna similar - retorna solo nombre sin prefijos"""
+    target_lower = target.lower()
+    
+    def limpiar_nombre(col):
+        if "[" in col and "]" in col:
+            return col.split("[")[-1].rstrip("]")
+        return col
+    
+    cols_limpias = [limpiar_nombre(col) for col in available_cols]
+    
+    # Coincidencia exacta
+    for col in cols_limpias:
+        if col.lower() == target_lower:
+            return col
+    
+    # Contiene palabra
+    for col in cols_limpias:
+        if target_lower in col.lower():
+            return col
+    
+    # Heurísticas para nombres de persona
+    if target_lower in ["nombre", "name", "empleado", "persona", "usuario", "user"]:
+        priority_keywords = ["nombre", "name", "apellido", "completo", "full"]
+        for kw in priority_keywords:
+            for col in cols_limpias:
+                col_lower = col.lower()
+                if kw in col_lower and not any(x in col_lower for x in ["id", "key", "codigo"]):
+                    return col
+    
+    return None
+
+
 def _validate_columns(params: dict, ctx: dict) -> dict:
-    """
-    Valida que las columnas especificadas en los parámetros existan en el contexto.
-    Si no existen, intenta encontrar columnas similares.
-    """
-    # Construir un mapa de todas las columnas disponibles (usar contexto filtrado)
+    """Valida que columnas existan y corrige si es necesario"""
     ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
     columnas_disponibles = {}
+    tipos_columnas = {}  # 🆕 Guardar tipos
+    
     for t in ctx_filtrado:
         if t.get("muestra") and len(t["muestra"]) > 0:
             tabla_nombre = t["nombre"]
             cols = list(t["muestra"][0].keys())
             columnas_disponibles[tabla_nombre] = cols
+            # Guardar tipos de cada columna
+            tipos_columnas[tabla_nombre] = {}
+            for col, val in t["muestra"][0].items():
+                tipos_columnas[tabla_nombre][col] = type(val).__name__
 
     # Validar dimension_columns
     dimension_cols_validadas = []
     for col_ref in params.get("dimension_columns", []):
-        # 🔧 CORRECCIÓN ROBUSTA DE SINTAXIS
         col_ref_corregido = _corregir_sintaxis_referencia(col_ref)
         if col_ref_corregido != col_ref:
             print(f"🔧 Corrigiendo sintaxis: {col_ref} → {col_ref_corregido}")
             col_ref = col_ref_corregido
 
-        # Extraer tabla y columna
         match = re.match(r"'([^']+)'\[([^\]]+)\]", col_ref)
         if match:
             tabla, columna = match.groups()
-
             if tabla in columnas_disponibles:
                 if columna in columnas_disponibles[tabla]:
                     dimension_cols_validadas.append(col_ref)
                 else:
-                    # Buscar columna similar
                     col_similar = _find_similar_column(columna, columnas_disponibles[tabla])
                     if col_similar:
                         print(f"⚠️ Corrigiendo columna: {columna} → {col_similar}")
                         dimension_cols_validadas.append(f"'{tabla}'[{col_similar}]")
-                    else:
-                        print(f"❌ Columna no encontrada: {col_ref}")
-            else:
-                print(f"❌ Tabla no encontrada: {tabla}")
 
     params["dimension_columns"] = dimension_cols_validadas
     
-    # Validar metric_expression (si es una columna, no una medida)
+    # Validar metric_expression
     metric = params.get("metric_expression", "")
     
-    # 🔧 CORRECCIÓN: Arreglar sintaxis incorrecta de GPT
-    # Cambiar 'Tabla[Col]' a 'Tabla'[Col]
-    if "(" in metric:  # Es una función como SUM, COUNT
-        # Buscar patrón: SUM('Tabla[Columna]')
+    if "(" in metric:
         pattern_incorrecto = r"(SUM|COUNT|AVERAGE)\('([^']+)\[([^\]]+)\]'\)"
         match = re.search(pattern_incorrecto, metric)
         if match:
             func, tabla, columna = match.groups()
             metric_correcto = f"{func}('{tabla}'[{columna}])"
-            print(f"🔧 Corrigiendo sintaxis: {metric} → {metric_correcto}")
+            print(f"🔧 Corrigiendo sintaxis métrica: {metric} → {metric_correcto}")
             params["metric_expression"] = metric_correcto
             metric = metric_correcto
     
-    if "SUM(" in metric or "COUNT(" in metric or "AVERAGE(" in metric:
+    # 🆕 VALIDAR QUE COLUMNA TENGA AGREGACIÓN
+    if "SUM(" in metric or "COUNT(" in metric or "AVERAGE(" in metric or "[" in metric:
         match = re.search(r"'([^']+)'\[([^\]]+)\]", metric)
         if match:
             tabla, columna = match.groups()
-            if tabla in columnas_disponibles:
-                if columna not in columnas_disponibles[tabla]:
-                    col_similar = _find_similar_column(columna, columnas_disponibles[tabla])
-                    if col_similar:
-                        print(f"⚠️ Corrigiendo columna en métrica: {columna} → {col_similar}")
-                        # ✅ CORRECCIÓN: Solo reemplazar el nombre de columna dentro de los corchetes
-                        func_match = re.match(r"(SUM|COUNT|AVERAGE)\('([^']+)'\[([^\]]+)\]\)", metric)
-                        if func_match:
-                            func, tabla_orig, _ = func_match.groups()
-                            # Asegurarse de que col_similar no tiene prefijo de tabla
-                            col_similar_limpia = col_similar.split("[")[-1].rstrip("]") if "[" in col_similar else col_similar
-                            params["metric_expression"] = f"{func}('{tabla_orig}'[{col_similar_limpia}])"
-                            print(f"✅ Métrica corregida: {params['metric_expression']}")
-                else:
-                    # ✅ VALIDAR TIPO DE DATO: No hacer SUM de fechas o strings
-                    tabla_ctx = next((t for t in ctx["contexto"] if t["nombre"] == tabla), None)
-                    if tabla_ctx and tabla_ctx.get("muestra"):
-                        tipo_valor = type(tabla_ctx["muestra"][0].get(columna)).__name__
+            
+            # Si NO tiene función de agregación, añadir SUM()
+            if not any(func in metric for func in ["SUM(", "COUNT(", "AVERAGE(", "MIN(", "MAX("]):
+                print(f"⚠️ Métrica sin agregación detectada: {metric}")
+                if tabla in columnas_disponibles:
+                    if columna in columnas_disponibles[tabla]:
+                        tipo_valor = tipos_columnas.get(tabla, {}).get(columna, "str")
                         
-                        # Si es fecha o string, cambiar a COUNT
-                        if tipo_valor in ["str", "DateTime"] or "date" in columna.lower() or "fecha" in columna.lower():
-                            print(f"⚠️ No se puede hacer SUM de {columna} (tipo: {tipo_valor}). Buscando columna numérica.")
+                        if tipo_valor in ["int", "int64", "float", "float64"]:
+                            params["metric_expression"] = f"SUM('{tabla}'[{columna}])"
+                            print(f"✅ Añadida agregación: SUM('{tabla}'[{columna}])")
+                        else:
+                            params["metric_expression"] = f"COUNTROWS('{tabla}')"
+                            print(f"✅ Columna no numérica, usando: COUNTROWS('{tabla}')")
+            elif "SUM(" in metric or "COUNT(" in metric or "AVERAGE(" in metric:
+                # Ya tiene agregación, validar que columna exista
+                if tabla in columnas_disponibles:
+                    if columna not in columnas_disponibles[tabla]:
+                        col_similar = _find_similar_column(columna, columnas_disponibles[tabla])
+                        if col_similar:
+                            print(f"⚠️ Corrigiendo columna en métrica: {columna} → {col_similar}")
+                            func_match = re.match(r"(SUM|COUNT|AVERAGE)\('([^']+)'\[([^\]]+)\]\)", metric)
+                            if func_match:
+                                func, tabla_orig, _ = func_match.groups()
+                                col_similar_limpia = col_similar.split("[")[-1].rstrip("]") if "[" in col_similar else col_similar
+                                params["metric_expression"] = f"{func}('{tabla_orig}'[{col_similar_limpia}])"
+                    else:
+                        # Validar tipo de dato
+                        tipo_valor = tipos_columnas.get(tabla, {}).get(columna, "str")
+                        
+                        if tipo_valor in ["str", "DateTime"] or "date" in columna.lower():
+                            print(f"⚠️ No se puede hacer SUM de {columna} ({tipo_valor}). Buscando numérica.")
                             
-                            # Buscar una columna numérica en la misma tabla
                             col_numerica = None
-                            for col, val in tabla_ctx["muestra"][0].items():
+                            for col, val in ctx_filtrado[0]["muestra"][0].items():
                                 col_lower = col.lower()
-                                # Buscar columnas numéricas relevantes (saldo, dias, horas, importe)
-                                if isinstance(val, (int, float)) and not any(k in col_lower for k in ["id", "key", "codigo"]):
-                                    # Priorizar columnas con keywords relevantes
-                                    if any(kw in col_lower for kw in ["saldo", "dias", "horas", "importe", "total", "cantidad"]):
-                                        col_numerica = col
-                                        break
-                            
-                            if not col_numerica:
-                                # Si no encontró con keywords, usar cualquier numérica
-                                for col, val in tabla_ctx["muestra"][0].items():
-                                    if isinstance(val, (int, float)) and "id" not in col.lower():
+                                tipo_col = tipos_columnas.get(tabla, {}).get(col, "str")
+                                if tipo_col in ["int", "int64", "float", "float64"] and not any(k in col_lower for k in ["id", "key", "codigo"]):
+                                    if any(kw in col_lower for kw in ["saldo", "dias", "horas", "importe", "total", "coste", "costo"]):
                                         col_numerica = col
                                         break
                             
@@ -660,100 +383,222 @@ def _validate_columns(params: dict, ctx: dict) -> dict:
                                 print(f"✅ Usando columna numérica: {col_numerica}")
                             else:
                                 params["metric_expression"] = f"COUNTROWS('{tabla}')"
-                                print(f"✅ Usando COUNTROWS en su lugar")
+                                print(f"✅ Usando COUNTROWS")
+    
+    # 🆕 VALIDAR Y LIMPIAR FILTROS
+    filtros_validados = []
+    for filtro in params.get("filters", []):
+        col_filtro = filtro.get("column", "")
+        val_filtro = filtro.get("value", "")
+        op_filtro = filtro.get("operator", "=")
+        
+        # 🚫 ELIMINAR FILTROS INVÁLIDOS
+        # 1. Operador inválido "IS NOT NULL"
+        if op_filtro.upper() in ["IS NOT NULL", "IS NULL", "IS"]:
+            print(f"🚫 Filtro inválido eliminado: {col_filtro} {op_filtro} {val_filtro}")
+            continue
+        
+        # 2. Valor None o "None"
+        if val_filtro is None or str(val_filtro).strip().upper() == "NONE":
+            print(f"🚫 Filtro con valor None eliminado: {col_filtro}")
+            continue
+        
+        # 3. Verificar compatibilidad de tipo columna vs valor
+        match = re.match(r"'([^']+)'\[([^\]]+)\]", col_filtro)
+        if match:
+            tabla, columna = match.groups()
+            if tabla in tipos_columnas and columna in tipos_columnas[tabla]:
+                tipo_columna = tipos_columnas[tabla][columna]
+                
+                # Si columna es numérica pero valor es fecha → ELIMINAR
+                if tipo_columna in ["int", "int64", "float", "float64"]:
+                    # Detectar si valor parece fecha
+                    if isinstance(val_filtro, str) and ("/" in val_filtro or "-" in val_filtro):
+                        try:
+                            datetime.datetime.strptime(val_filtro.split()[0], "%d/%m/%Y")
+                            print(f"🚫 Filtro incompatible eliminado: columna numérica {col_filtro} vs fecha '{val_filtro}'")
+                            continue
+                        except:
+                            pass
+                
+                # Si columna es fecha, validar que valor sea fecha
+                if tipo_columna == "DateTime" or "date" in columna.lower() or "fecha" in columna.lower():
+                    if isinstance(val_filtro, str):
+                        # Intentar parsear como fecha
+                        fecha_valida = False
+                        if "/" in val_filtro or "-" in val_filtro:
+                            formatos = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]
+                            for fmt in formatos:
+                                try:
+                                    datetime.datetime.strptime(val_filtro.split()[0], fmt)
+                                    fecha_valida = True
+                                    break
+                                except:
+                                    pass
+                        
+                        if not fecha_valida:
+                            print(f"🚫 Filtro de fecha inválido eliminado: {col_filtro} = '{val_filtro}'")
+                            continue
+        
+        # Si pasa todas las validaciones, añadir
+        filtros_validados.append(filtro)
+    
+    params["filters"] = filtros_validados
+    
+    if len(filtros_validados) < len(params.get("filters", [])):
+        print(f"✅ Filtros limpiados: {len(params.get('filters', []))} → {len(filtros_validados)}")
     
     return params
 
 
-def _find_similar_column(target: str, available_cols: list) -> str | None:
-    """
-    Busca una columna similar usando heurísticas simples.
-    Por ejemplo, si busca "Nombre" puede encontrar "US_nombre" o "nombreCompleto"
+# ============================================
+# EXTRACCIÓN DE PARÁMETROS CON GPT
+# ============================================
+def _extract_query_parameters(prompt: str, ctx: dict, pattern_name: str) -> dict:
+    """GPT identifica componentes necesarios (versión optimizada)"""
+    dataset_name = ctx.get("cm_seleccionado", "")
+    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
+
+    # Obtener fecha actual
+    fecha_hoy = datetime.datetime.now()
+    contexto_temporal = f"\n📅 FECHA ACTUAL: {fecha_hoy.strftime('%d/%m/%Y')} (use esta fecha si preguntan 'hoy', 'ahora', 'actual')"
+
+    # 🆕 DETECCIÓN AUTOMÁTICA DE COLUMNAS
+    columna_nombre_auto = _detectar_columna_nombre_persona(ctx)
     
-    IMPORTANTE: Retorna SOLO el nombre de columna, sin prefijos de tabla
-    """
-    target_lower = target.lower()
+    # Sugerencias del schema
+    schema_hints = ""
+    if SCHEMAS_DISPONIBLES and dataset_name:
+        persona_info = get_columna_nombre_persona(dataset_name)
+        metrica_info = get_metrica_principal(dataset_name)
+        if persona_info or metrica_info:
+            schema_hints = "\n\nSUGERENCIAS DEL SCHEMA:"
+            if persona_info:
+                schema_hints += f"\n- Persona: '{persona_info[0]}'[{persona_info[1]}]"
+            if metrica_info:
+                schema_hints += f"\n- Métrica: SUM('{metrica_info[0]}'[{metrica_info[1]}])"
     
-    # Limpiar nombres de columnas que puedan tener prefijo de tabla
-    def limpiar_nombre(col):
-        """Extrae solo el nombre de columna, sin prefijo de tabla"""
-        if "[" in col and "]" in col:
-            return col.split("[")[-1].rstrip("]")
-        return col
+    # 🆕 Si detectamos columna de nombre automáticamente, priorizar sobre schema
+    if columna_nombre_auto:
+        if schema_hints:
+            schema_hints = f"\n\n⚠️ COLUMNA DETECTADA EN DATOS (USAR ESTA):"
+            schema_hints += f"\n- Persona: '{columna_nombre_auto[0]}'[{columna_nombre_auto[1]}]"
+        else:
+            schema_hints = f"\n\nCOLUMNA DETECTADA:"
+            schema_hints += f"\n- Persona: '{columna_nombre_auto[0]}'[{columna_nombre_auto[1]}]"
     
-    cols_limpias = [limpiar_nombre(col) for col in available_cols]
+    # Contexto simplificado
+    tablas_disponibles = []
+    for t in ctx_filtrado[:6]:
+        if not t.get("muestra") or len(t["muestra"]) == 0:
+            continue
+        cols_con_ejemplo = []
+        for col_name, col_value in list(t["muestra"][0].items())[:10]:
+            cols_con_ejemplo.append({
+                "nombre": col_name,
+                "tipo": type(col_value).__name__
+            })
+        tablas_disponibles.append({
+            "nombre": t["nombre"],
+            "columnas": cols_con_ejemplo
+        })
     
-    # 1. Coincidencia exacta (case-insensitive)
-    for col in cols_limpias:
-        if col.lower() == target_lower:
-            return col
+    prompt_gpt = f"""Experto en Power BI DAX. Identifica componentes para query.
+{contexto_temporal}
+
+PREGUNTA: "{prompt}"
+TABLAS: {json.dumps(tablas_disponibles, ensure_ascii=False)}{schema_hints}
+
+PATRÓN: {pattern_name}
+
+REGLAS SINTAXIS CRÍTICAS:
+1. 'Tabla'[Columna] ← correcto
+2. 'Tabla[Columna]' ← incorrecto
+
+3. ⚠️ MÉTRICAS - SIEMPRE CON AGREGACIÓN:
+   - ❌ INCORRECTO: "metric_expression": "'Tabla'[Columna]"
+   - ✅ CORRECTO: "metric_expression": "SUM('Tabla'[Columna])"
+   - Funciones válidas: SUM(), COUNT(), AVERAGE(), MIN(), MAX()
+
+4. ⚠️ FECHAS - MUY IMPORTANTE:
+   - En JSON filters, pon valor como STRING simple: "15/11/2025"
+   - ❌ NO pongas: "DATE(2025, 11, 15)" como string
+   - ✅ CORRECTO: {{"column": "'Tabla'[Fecha]", "operator": "=", "value": "15/11/2025"}}
+
+5. Para nombres: usa columnas descriptivas, NO códigos/IDs
+
+JSON requerido:
+{{
+    "tabla_principal": "nombre_tabla",
+    "dimension_columns": ["'Tabla'[Columna]"],
+    "metric_expression": "SUM('Tabla'[Columna])",
+    "metric_name": "Nombre resultado",
+    "filters": [
+        {{"column": "'Tabla'[Nombre]", "operator": "=", "value": "Juan"}},
+        {{"column": "'Tabla'[Fecha]", "operator": "=", "value": "15/11/2025"}}
+    ],
+    "n": 10
+}}
+
+EJEMPLOS MÉTRICA CORRECTA:
+- "metric_expression": "SUM('FACT_Costos'[Importe])"
+- "metric_expression": "COUNT('Sales'[OrderID])"
+- "metric_expression": "AVERAGE('Products'[Price])"
+
+Solo JSON:"""
     
-    # 2. Contiene la palabra completa
-    for col in cols_limpias:
-        if target_lower in col.lower():
-            return col
-    
-    # 3. La columna contiene la palabra buscada
-    for col in cols_limpias:
-        if target_lower in col.lower().split("_"):
-            return col
-    
-    # 4. Heurísticas especiales para nombres comunes
-    if target_lower in ["nombre", "name", "empleado", "persona", "usuario", "user"]:
-        # Priorizar columnas descriptivas sobre IDs
-        priority_keywords = ["nombre", "name", "apellido", "completo", "full"]
-        for kw in priority_keywords:
-            for col in cols_limpias:
-                col_lower = col.lower()
-                # Evitar IDs explícitamente
-                if kw in col_lower and not any(x in col_lower for x in ["id", "key", "codigo", "code"]):
-                    return col
+    try:
+        response = openai.ChatCompletion.create(
+            engine=DEPLOYMENT_GPT4O,
+            temperature=0,
+            max_tokens=800,
+            messages=[
+                {"role": "system", "content": "Experto DAX. Respondes solo JSON válido."},
+                {"role": "user", "content": prompt_gpt}
+            ]
+        )
         
-        # Si no encontró con keywords priority, buscar cualquiera sin ID
-        for col in cols_limpias:
-            col_lower = col.lower()
-            if any(k in col_lower for k in ["nombre", "name", "usuario", "user", "persona"]):
-                if not any(x in col_lower for x in ["id", "key"]):
-                    return col
-    
-    return None
+        text = response["choices"][0]["message"]["content"].strip()
+        text = re.sub(r'```json\n?|```\n?', '', text)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        params = json.loads(match.group(0) if match else text)
+        
+        params.setdefault("dimension_columns", [])
+        params.setdefault("metric_name", "Resultado")
+        params.setdefault("filters", [])
+        params.setdefault("n", 10)
+        
+        params = _validate_columns(params, ctx)
+        print(f"✅ Parámetros extraídos")
+        return params
+        
+    except Exception as e:
+        print(f"❌ Error GPT: {e}")
+        return _fallback_parameters(prompt, ctx)
 
 
 def _fallback_parameters(prompt: str, ctx: dict) -> dict:
-    """Extracción de parámetros con heurísticas si GPT falla"""
-    print("⚠️ Usando extracción heurística de parámetros")
-
+    """Extracción heurística si GPT falla"""
+    print("⚠️ Usando extracción heurística")
+    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
     dataset_name = ctx.get("cm_seleccionado", "")
 
-    # Usar contexto filtrado
-    ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
-
-    # 🆕 INTENTAR USAR SCHEMA PRIMERO
     if SCHEMAS_DISPONIBLES and dataset_name:
         schema = get_schema(dataset_name)
         if schema:
-            print("📌 Usando información del schema")
-
-            # Obtener tabla principal
             tabla_principal = schema.get("tabla_principal", "None")
             if tabla_principal == "None" and schema.get("tablas_fact"):
                 tabla_principal = schema["tablas_fact"][0]
 
-            # Obtener dimensión de persona
             dimension_col = None
             persona_info = get_columna_nombre_persona(dataset_name)
             if persona_info:
-                tabla_persona, col_persona = persona_info
-                dimension_col = f"'{tabla_persona}'[{col_persona}]"
-                print(f"✅ Dimensión desde schema: {dimension_col}")
+                dimension_col = f"'{persona_info[0]}'[{persona_info[1]}]"
 
-            # Obtener métrica
             metric_col = None
             metrica_info = get_metrica_principal(dataset_name)
             if metrica_info:
-                tabla_metrica, col_metrica = metrica_info
-                metric_col = f"SUM('{tabla_metrica}'[{col_metrica}])"
-                print(f"✅ Métrica desde schema: {metric_col}")
+                metric_col = f"SUM('{metrica_info[0]}'[{metrica_info[1]}])"
 
             if dimension_col or metric_col:
                 return {
@@ -765,73 +610,38 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
                     "n": 10
                 }
 
-    # Fallback original si no hay schema
-    # Buscar tabla principal (primera fact o primera tabla)
+    # Fallback sin schema
     tabla_principal = next(
         (t["nombre"] for t in ctx_filtrado if "fact" in t["nombre"].lower()),
         ctx_filtrado[0]["nombre"] if ctx_filtrado else ""
     )
     
-    # Buscar columna de dimensión (nombre, usuario, empleado)
-    # Priorizar tablas DIM y stg con información de usuarios
     dimension_col = None
     prioridad_tablas = ["stg RRHH_Users", "DIM_Responsable", "stg GEN_DptoRRHH"]
-
-    # Primero buscar en tablas prioritarias
+    
     for tabla_name in prioridad_tablas:
         t = next((tab for tab in ctx_filtrado if tab["nombre"] == tabla_name), None)
         if t and t.get("muestra"):
-            cols = list(t["muestra"][0].keys())
-            # Buscar columnas descriptivas, evitando IDs
-            for col in cols:
+            for col in t["muestra"][0].keys():
                 col_lower = col.lower()
-                if any(k in col_lower for k in ["nombre", "name", "apellido", "usuario", "user"]):
-                    if not any(x in col_lower for x in ["id", "key", "codigo"]):
+                if any(k in col_lower for k in ["nombre", "apellido", "usuario"]):
+                    if not any(x in col_lower for x in ["id", "key"]):
                         dimension_col = f"'{t['nombre']}'[{col}]"
                         break
             if dimension_col:
                 break
 
-    # Si no encontró en tablas prioritarias, buscar en todas
-    if not dimension_col:
-        for t in ctx_filtrado:
-            if t.get("muestra"):
-                cols = list(t["muestra"][0].keys())
-                for col in cols:
-                    col_lower = col.lower()
-                    if any(k in col_lower for k in ["nombre", "name", "usuario", "empleado", "persona"]):
-                        if not any(x in col_lower for x in ["id", "key"]):
-                            dimension_col = f"'{t['nombre']}'[{col}]"
-                            break
-                if dimension_col:
-                    break
-
-    # Buscar columna numérica (priorizar columnas con keywords relevantes)
     metric_col = None
-    keywords_metricas = ["saldo", "dias", "horas", "importe", "total", "cantidad", "valor"]
-
+    keywords_metricas = ["saldo", "dias", "horas", "importe", "total"]
     for t in ctx_filtrado:
-        if t.get("muestra") and t["muestra"]:
-            # Primero buscar con keywords
+        if t.get("muestra"):
             for col, val in t["muestra"][0].items():
-                col_lower = col.lower()
-                if isinstance(val, (int, float)) and any(kw in col_lower for kw in keywords_metricas):
-                    if not any(k in col_lower for k in ["id", "key", "codigo"]):
+                if isinstance(val, (int, float)) and any(kw in col.lower() for kw in keywords_metricas):
+                    if not any(k in col.lower() for k in ["id", "key"]):
                         metric_col = f"SUM('{t['nombre']}'[{col}])"
                         break
             if metric_col:
                 break
-
-    # Si no encontró con keywords, usar cualquier numérica
-    if not metric_col:
-        for t in ctx_filtrado:
-            if t.get("muestra") and t["muestra"]:
-                for col, val in t["muestra"][0].items():
-                    if isinstance(val, (int, float)) and not any(k in col.lower() for k in ["id", "key", "codigo"]):
-                        metric_col = f"SUM('{t['nombre']}'[{col}])"
-                        break
-                if metric_col:
-                    break
     
     return {
         "tabla_principal": tabla_principal,
@@ -844,161 +654,153 @@ def _fallback_parameters(prompt: str, ctx: dict) -> dict:
 
 
 # ============================================
-# CONSTRUCCIÓN DE DAX DESDE PATRÓN
+# CONSTRUCCIÓN DE DAX
 # ============================================
-def _format_filter_value(val, col_tipo=None):
-    """
-    Formatea un valor de filtro según su tipo para DAX.
-
-    Args:
-        val: Valor a formatear
-        col_tipo: Tipo de la columna (opcional) para detectar fechas
-
-    Returns:
-        str: Valor formateado para DAX
-    """
-    # Detectar fechas
-    if isinstance(val, datetime.datetime):
-        return f"DATE({val.year}, {val.month}, {val.day})"
-    elif isinstance(val, datetime.date):
+def _format_filter_value(val, col_ref=None, ctx=None):
+    """Formatea valor de filtro para DAX detectando tipo de columna"""
+    if isinstance(val, (datetime.datetime, datetime.date)):
         return f"DATE({val.year}, {val.month}, {val.day})"
     elif isinstance(val, str):
-        # 1. Intentar convertir a número si es string numérico
-        # Esto evita errores de comparación Integer vs Text
-        if val.strip().replace('.', '', 1).replace('-', '', 1).isdigit():
-            # Es un número (puede tener punto decimal o signo negativo)
+        val_stripped = val.strip()
+        
+        # 🔥 CRÍTICO: Si ya es función DATE(), retornar sin comillas
+        if val_stripped.startswith("DATE(") and val_stripped.endswith(")"):
+            print(f"📅 Función DATE detectada, retornando sin comillas: {val_stripped}")
+            return val_stripped
+        
+        # 🆕 DETECTAR TIPO DE COLUMNA si disponible
+        if col_ref and ctx:
+            match = re.match(r"'([^']+)'\[([^\]]+)\]", col_ref)
+            if match:
+                tabla, columna = match.groups()
+                tabla_ctx = next((t for t in ctx.get("contexto", []) if t["nombre"] == tabla), None)
+                if tabla_ctx and tabla_ctx.get("muestra"):
+                    primer_valor = tabla_ctx["muestra"][0].get(columna)
+                    tipo_columna = type(primer_valor).__name__
+                    
+                    # Si columna es integer/float pero valor es string, convertir
+                    if tipo_columna in ["int", "int64", "float", "float64"]:
+                        try:
+                            num_val = float(val_stripped)
+                            if num_val == int(num_val):
+                                print(f"🔢 Convirtiendo '{val}' a {int(num_val)} (columna tipo {tipo_columna})")
+                                return str(int(num_val))
+                            print(f"🔢 Convirtiendo '{val}' a {num_val} (columna tipo {tipo_columna})")
+                            return str(num_val)
+                        except ValueError:
+                            pass
+                    
+                    # Si columna es DateTime, convertir a DATE()
+                    elif tipo_columna == "DateTime" or "date" in columna.lower() or "fecha" in columna.lower():
+                        if "/" in val_stripped or "-" in val_stripped:
+                            fecha_parte = val_stripped.split()[0] if " " in val_stripped else val_stripped
+                            formatos = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%m/%d/%Y"]
+                            for fmt in formatos:
+                                try:
+                                    dt = datetime.datetime.strptime(fecha_parte, fmt)
+                                    print(f"📅 Fecha detectada: '{val}' → DATE({dt.year}, {dt.month}, {dt.day})")
+                                    return f"DATE({dt.year}, {dt.month}, {dt.day})"
+                                except ValueError:
+                                    continue
+        
+        # Detectar número (sin contexto)
+        if val_stripped.replace('.', '', 1).replace('-', '', 1).isdigit():
             try:
-                # Intentar como float primero
-                num_val = float(val)
-                # Si es entero, devolver sin decimales
+                num_val = float(val_stripped)
                 if num_val == int(num_val):
-                    print(f"🔢 Número detectado: \"{val}\" → {int(num_val)}")
                     return str(int(num_val))
-                else:
-                    print(f"🔢 Número detectado: \"{val}\" → {num_val}")
-                    return str(num_val)
+                return str(num_val)
             except ValueError:
                 pass
-
-        # 2. Intentar parsear como fecha si parece una fecha
-        if "/" in val or "-" in val:
-            # Eliminar hora si existe
-            fecha_parte = val.split()[0] if " " in val else val
-
-            # Lista de formatos a intentar
-            formatos_fecha = [
-                "%d/%m/%Y",      # 01/10/2023
-                "%Y-%m-%d",      # 2023-10-01
-                "%d-%m-%Y",      # 01-10-2023
-                "%Y/%m/%d",      # 2023/10/01
-                "%m/%d/%Y",      # 10/01/2023 (formato US)
-            ]
-
-            for fmt in formatos_fecha:
+        
+        # Parsear fecha (sin contexto) - PRIORIDAD ALTA
+        if "/" in val_stripped or "-" in val_stripped:
+            fecha_parte = val_stripped.split()[0] if " " in val_stripped else val_stripped
+            formatos = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%y"]
+            for fmt in formatos:
                 try:
                     dt = datetime.datetime.strptime(fecha_parte, fmt)
-                    print(f"📅 Fecha parseada: {val} → DATE({dt.year}, {dt.month}, {dt.day})")
+                    print(f"📅 Fecha detectada (sin contexto): '{val}' → DATE({dt.year}, {dt.month}, {dt.day})")
                     return f"DATE({dt.year}, {dt.month}, {dt.day})"
                 except ValueError:
                     continue
-
-        # 3. Si no es número ni fecha, escapar como string
-        if not val.startswith('"'):
-            return f'"{val}"'
-        return val
+        
+        # String normal
+        return f'"{val_stripped}"' if not val_stripped.startswith('"') else val_stripped
     elif isinstance(val, (int, float)):
         return str(val)
-    else:
-        return str(val)
+    return str(val)
 
 
-def _build_dax_from_pattern(pattern: dict, params: dict) -> str:
-    """
-    Construye query DAX aplicando el patrón con los parámetros extraídos.
-
-    IMPORTANTE: Cuando hay filtros con SUMMARIZECOLUMNS, usa CALCULATETABLE para evitar errores.
-    """
-
+def _build_dax_from_pattern(pattern: dict, params: dict, ctx: dict = None) -> str:
+    """Construye query DAX desde patrón y parámetros"""
     template = pattern["template"]
-
-    # Construir componentes
     dimension_cols = ", ".join(params.get("dimension_columns", [])) if params.get("dimension_columns") else ""
     metric_expr = params.get("metric_expression", "1")
     metric_name = params.get("metric_name", "Resultado")
     tiene_filtros = bool(params.get("filters"))
 
-    # ✅ Si no hay dimension_columns, usar ROW() para valor único
+    # Sin dimensiones → ROW()
     if not dimension_cols and "SUMMARIZECOLUMNS" in template:
         if tiene_filtros:
             filter_parts = []
             for f in params["filters"]:
                 col = _corregir_sintaxis_referencia(f["column"])
                 op = f.get("operator", "=")
-                val = _format_filter_value(f["value"])
+                val = _format_filter_value(f["value"], col, ctx)
                 filter_parts.append(f"{col} {op} {val}")
-
             filters_str = ",\n        " + ",\n        ".join(filter_parts)
-
-            dax = f"""EVALUATE
+            return f"""EVALUATE
 ROW(
     "{metric_name}", CALCULATE(
         {metric_expr}{filters_str}
     )
 )"""
         else:
-            dax = f"""EVALUATE
+            return f"""EVALUATE
 ROW(
     "{metric_name}", {metric_expr}
 )"""
-        return dax.strip()
 
-    # ✅ CORRECCIÓN PRINCIPAL: Cuando hay filtros Y dimension_columns, usar CALCULATETABLE
+    # Con filtros Y dimensiones → CALCULATETABLE
     if tiene_filtros and dimension_cols:
-        # Construir filtros correctamente formateados
         filter_parts = []
         for f in params["filters"]:
             col = _corregir_sintaxis_referencia(f["column"])
             op = f.get("operator", "=")
-            val = _format_filter_value(f["value"])
+            val = _format_filter_value(f["value"], col, ctx)
             filter_parts.append(f"{col} {op} {val}")
-
         filters_str = ",\n    " + ",\n    ".join(filter_parts)
-
-        # Usar CALCULATETABLE en lugar de poner filtros directamente en SUMMARIZECOLUMNS
-        dax = f"""EVALUATE
+        return f"""EVALUATE
 CALCULATETABLE(
     SUMMARIZECOLUMNS(
         {dimension_cols},
         "{metric_name}", {metric_expr}
     ){filters_str}
 )"""
-        return dax.strip()
 
-    # Sin filtros, usar SUMMARIZECOLUMNS normal
+    # Sin filtros
     if dimension_cols:
-        dax = f"""EVALUATE
+        return f"""EVALUATE
 SUMMARIZECOLUMNS(
     {dimension_cols},
     "{metric_name}", {metric_expr}
 )"""
-        return dax.strip()
 
-    # Fallback: usar template original (para patterns especiales como top_n)
+    # Fallback
     try:
-        # Construir filtros para template (si existen)
         filters_str = ""
         if tiene_filtros:
             filter_parts = []
             for f in params["filters"]:
                 col = _corregir_sintaxis_referencia(f["column"])
                 op = f.get("operator", "=")
-                val = _format_filter_value(f["value"])
+                val = _format_filter_value(f["value"], col, ctx)
                 filter_parts.append(f"{col} {op} {val}")
-
             if filter_parts:
                 filters_str = ",\n    " + ",\n    ".join(filter_parts)
-
-        dax = template.format(
+        
+        return template.format(
             dimension_columns=dimension_cols,
             filters=filters_str,
             metric_name=metric_name,
@@ -1006,223 +808,79 @@ SUMMARIZECOLUMNS(
             table=params.get("tabla_principal", ""),
             n=params.get("n", 10)
         )
-        return dax.strip()
-    except KeyError as e:
-        print(f"❌ Error formateando template: {e}")
-        # Fallback a pattern más simple
+    except KeyError:
         return f"EVALUATE\nROW(\"{metric_name}\", {metric_expr})"
 
 
 # ============================================
-# EJECUCIÓN DE DAX
+# EJECUCIÓN DAX
 # ============================================
-def _ejecutar_dax(dax_query: str, dataset_name: str, timeout: int = 60) -> pd.DataFrame:
-    """
-    Ejecuta query DAX y devuelve DataFrame con manejo robusto de errores.
-
-    Args:
-        dax_query: Query DAX a ejecutar (debe comenzar con EVALUATE)
-        dataset_name: Nombre del dataset de Power BI
-        timeout: Timeout en segundos para la query (default: 60)
-
-    Returns:
-        pd.DataFrame: Resultado de la query
-
-    Raises:
-        ValueError: Si la query no es válida
-        ConnectionError: Si hay problemas de conexión
-        RuntimeError: Si la query falla por problemas de sintaxis o datos
-    """
-
-    # ✅ Validaciones básicas
-    if not dax_query or not dax_query.strip():
-        raise ValueError("La query DAX no puede estar vacía")
-
+def _ejecutar_dax(dax_query: str, dataset_name: str) -> pd.DataFrame:
+    """Ejecuta query DAX"""
     if not dax_query.strip().upper().startswith("EVALUATE"):
-        raise ValueError("La query DAX debe comenzar con EVALUATE")
-
-    if not dataset_name or not dataset_name.strip():
-        raise ValueError("El nombre del dataset no puede estar vacío")
-
-    print(f"\n🔧 Ejecutando query DAX:\n{dax_query[:500]}{'...' if len(dax_query) > 500 else ''}\n")
-
-    conn = None
-    reader = None
-
+        raise ValueError("Query DAX debe comenzar con EVALUATE")
+    
+    connection_string = (
+        f"Provider=MSOLAP;"
+        f"Data Source={WORKSPACE_URL};"
+        f"Initial Catalog={dataset_name};"
+        f"Integrated Security=ClaimsToken;"
+    )
+    
+    print(f"\n🔧 Ejecutando DAX:\n{dax_query[:300]}...\n")
+    
     try:
-        # Usar la función mejorada de conexión con reintentos
-        conn = _open_conn(dataset_name)
-
+        conn = AdomdConnection(connection_string)
+        conn.Open()
         cmd = AdomdCommand(dax_query, conn)
-
-        # Configurar timeout si es posible
-        try:
-            cmd.CommandTimeout = timeout
-        except:
-            pass  # Algunos proveedores no soportan CommandTimeout
-
         reader = cmd.ExecuteReader()
-
-        # Extraer columnas
+        
         cols = [reader.GetName(i) for i in range(reader.FieldCount)]
-
-        # Extraer filas
         rows = []
-        row_count = 0
-        max_rows = 100000  # Límite de seguridad
-
-        while reader.Read() and row_count < max_rows:
+        while reader.Read():
             rows.append([reader.GetValue(i) for i in range(reader.FieldCount)])
-            row_count += 1
-
-        if row_count >= max_rows:
-            print(f"⚠️ Advertencia: Se alcanzó el límite de {max_rows} filas. Puede haber más datos.")
-
+        
+        conn.Close()
         df = pd.DataFrame(rows, columns=cols)
-        print(f"✅ Query ejecutada exitosamente: {len(df)} filas devueltas")
+        print(f"✅ Query ejecutada: {len(df)} filas")
         return df
-
-    except ConnectionError as e:
-        # Ya manejado por _open_conn, solo re-lanzar
-        print(f"❌ Error de conexión: {e}")
-        raise
-
-    except ValueError as e:
-        # Error de validación
-        print(f"❌ Error de validación: {e}")
-        raise
-
+        
     except Exception as e:
         error_msg = str(e)
-
-        # Detectar y reportar errores comunes de DAX
-        if "no se encuentra la tabla" in error_msg.lower() or "table" in error_msg.lower() and "not found" in error_msg.lower():
-            print(f"❌ Error: Tabla no encontrada en el modelo")
-            print(f"💡 Sugerencia: Verifica que el nombre de la tabla existe y usa comillas simples: 'NombreTabla'")
-            raise RuntimeError(f"Tabla no encontrada en el modelo: {error_msg}") from e
-
-        elif "no se encuentra la columna" in error_msg.lower() or "column" in error_msg.lower() and "not found" in error_msg.lower():
-            print(f"❌ Error: Columna no encontrada")
-            print(f"💡 Sugerencia: Verifica el nombre exacto de la columna en el modelo")
-            raise RuntimeError(f"Columna no encontrada: {error_msg}") from e
-
-        elif "no puede utilizarse" in error_msg.lower() or "cannot be used" in error_msg.lower():
-            print(f"❌ Error: Tipo de dato incompatible")
-            print(f"💡 Sugerencia: No se puede hacer SUM() de fechas o textos, COUNT() es más apropiado")
-            raise RuntimeError(f"Tipo de dato incompatible: {error_msg}") from e
-
-        elif "sintaxis" in error_msg.lower() or "syntax" in error_msg.lower():
-            print(f"❌ Error de sintaxis DAX")
-            print(f"💡 Sugerencia: Revisa las comillas y paréntesis en la query")
-            raise RuntimeError(f"Error de sintaxis DAX: {error_msg}") from e
-
-        elif "timeout" in error_msg.lower() or "tiempo de espera" in error_msg.lower():
-            print(f"❌ Error: Timeout ejecutando la query")
-            print(f"💡 Sugerencia: La query es demasiado compleja o los datos son muy grandes. Intenta filtrar más.")
-            raise RuntimeError(f"Timeout en query DAX: {error_msg}") from e
-
-        # Error genérico
-        print(f"❌ Error ejecutando query DAX: {error_msg}")
-        raise RuntimeError(f"Error ejecutando query DAX: {error_msg}") from e
-
-    finally:
-        # Limpiar recursos
-        try:
-            if reader is not None:
-                reader.Close()
-        except:
-            pass
-
-        try:
-            if conn is not None:
-                conn.Close()
-        except:
-            pass
+        if "No se encuentra la tabla" in error_msg:
+            print(f"❌ Tabla no encontrada")
+        elif "No se encuentra la columna" in error_msg:
+            print(f"❌ Columna no encontrada")
+        raise e
 
 
 # ============================================
-# RESUMEN DE RESULTADOS (OPTIMIZADO)
+# RESUMEN CON GPT
 # ============================================
-# Prompt base reutilizable
-_FEMXA_SYSTEM_MSG = """Eres un analista de datos de FEMXA, empresa de formación profesional.
-Interpretas datos académicos, de RRHH y operativos.
-Comunicas resultados con precisión usando terminología educativa.
-Eres profesional, claro y orientado a insights accionables.
-
-FECHA ACTUAL: {fecha_actual}
-Siempre ten en cuenta esta fecha para interpretar consultas temporales (hoy, esta semana, este mes, este año, etc.)"""
-
-_FEMXA_CONTEXT = """CONTEXTO EMPRESARIAL:
-- FEMXA gestiona programas formativos, cursos profesionales y capacitación
-- Datos típicos: alumnos, instructores, cursos, asistencias, calificaciones, vacaciones, horas lectivas
-- Tu audiencia son gestores, coordinadores académicos y responsables de RRHH
-- Fecha de hoy: {fecha_actual}"""
-
-def _get_fecha_actual() -> str:
-    """Obtiene la fecha actual formateada para el contexto del agente"""
-    now = datetime.datetime.now()
-    dias_semana = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-
-    dia_semana = dias_semana[now.weekday()]
-    mes = meses[now.month - 1]
-
-    return f"{dia_semana} {now.day} de {mes} de {now.year}"
-
 def _resumir_resultado(df: pd.DataFrame, user_prompt: str, todos_resultados: dict = None) -> str:
-    """
-    Función unificada para generar resumen en lenguaje natural.
-    Soporta tanto queries simples como múltiples.
-    """
+    """Genera resumen en lenguaje natural"""
     if df.empty:
         return "La consulta no devolvió resultados."
 
-    # Preparar datos según tipo de query - SIEMPRE TODOS LOS DATOS
     if todos_resultados:
-        # Multi-query: Incluir todas las queries COMPLETAS
-        contexto_datos = {
-            "query_principal": {
-                "datos": df.to_dict(orient="records"),  # Todos los datos
-                "filas_totales": len(df)
-            }
-        }
+        contexto_datos = {"query_principal": {"datos": df.head(10).to_dict(orient="records")}}
         for key, res in todos_resultados.items():
             if key != "principal":
-                contexto_datos[key] = {
-                    "proposito": res.get("proposito", ""),
-                    "descripcion": res.get("descripcion", ""),
-                    "datos": res.get("preview", [])
-                }
-        max_tokens = 1500  # Aumentado para soportar más datos
+                contexto_datos[key] = {"datos": res.get("preview", [])}
+        max_tokens = 500
     else:
-        # Query simple: Enviar TODAS las filas sin limitación
-        contexto_datos = df.to_dict(orient="records")  # Todos los datos
-        max_tokens = 1000  # Aumentado para soportar más datos
+        contexto_datos = df.head(20).to_dict(orient="records")
+        max_tokens = 400
 
-    # Obtener fecha actual para contexto
-    fecha_actual = _get_fecha_actual()
-
-    prompt = f"""Eres un analista de datos de FEMXA, empresa líder en formación profesional.
-
-{_FEMXA_CONTEXT.format(fecha_actual=fecha_actual)}
+    prompt = f"""Analista de FEMXA (formación profesional).
 
 PREGUNTA: "{user_prompt}"
+DATOS: {json.dumps(contexto_datos, ensure_ascii=False, default=_to_json_safe)}
 
-RESULTADOS POWER BI:
-{json.dumps(contexto_datos, ensure_ascii=False, indent=2, default=_to_json_safe)}{nota_filas}
+Responde directamente con datos. Usa terminología formativa: alumnos, cursos, instructores.
+Máximo 4 líneas. Sé preciso con números.
 
-INSTRUCCIONES:
-1. Responde directamente usando TODOS los datos disponibles
-2. Usa terminología formativa: alumnos, cursos, instructors, finalizaciones
-3. Sé preciso con números y porcentajes
-4. Conciso (máx 4-5 líneas)
-
-EJEMPLOS:
-- "El 75% de alumnos finalizaron. De 400 matriculados, 300 completaron el curso."
-- "8 empleados RRHH tienen 125 días de vacaciones pendientes en total."
-
-Respuesta como analista FEMXA:"""
+Respuesta:"""
 
     try:
         response = openai.ChatCompletion.create(
@@ -1230,150 +888,102 @@ Respuesta como analista FEMXA:"""
             temperature=0.3,
             max_tokens=max_tokens,
             messages=[
-                {"role": "system", "content": _FEMXA_SYSTEM_MSG.format(fecha_actual=fecha_actual)},
+                {"role": "system", "content": "Analista de datos FEMXA."},
                 {"role": "user", "content": prompt}
             ]
         )
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"⚠️ Error generando resumen: {e}")
+        print(f"⚠️ Error resumen: {e}")
         if len(df) == 1 and len(df.columns) == 1:
-            return f"El resultado es: {df.iloc[0, 0]}"
-        return f"Se encontraron {len(df)} registros. Datos: {df.to_dict(orient='records')}"
+            return f"Resultado: {df.iloc[0, 0]}"
+        return f"Se encontraron {len(df)} registros."
 
 
 # ============================================
-# FALLBACK: GPT GENERA DAX COMPLETO
+# FALLBACK GPT COMPLETO
 # ============================================
-# NOTA: La función _fix_table_quotes fue reemplazada por _fix_table_quotes_v2 (más abajo)
-# que maneja más casos de corrección de sintaxis
-
-
 def _fix_table_quotes_v2(dax: str) -> str:
-    """
-    Versión mejorada: Corrige referencias a tablas y columnas en DAX.
-
-    Problemas comunes que corrige:
-    1. Tabla[Columna] → 'Tabla'[Columna]
-    2. 'Tabla[Columna]' → 'Tabla'[Columna]
-    3. 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col] (comillas anidadas)
-    4. 'Table-'guid'[Col]' → 'Table-guid'[Col] (comillas cortadas en GUIDs)
-    """
-
-    # 1. CRÍTICO: Corregir nombres de tabla con GUIDs cortados
-    # Pattern: 'TableName-'restOfGuid'[Column]
-    # Ejemplo: 'DateTableTemplate_cb2f60f2-17a4-4889-b229-'e99fada39121'[NroMes]
-    # → 'DateTableTemplate_cb2f60f2-17a4-4889-b229-e99fada39121'[NroMes]
+    """Corrige sintaxis DAX - VERSIÓN MEJORADA v2"""
+    
+    # 1. CRÍTICO: Comillas faltantes al inicio de línea o después de coma
+    # Patrón: ", stg RRHH_Users'[Col]" o "\n    stg RRHH_Users'[Col]"
+    # → ", 'stg RRHH_Users'[Col]" o "\n    'stg RRHH_Users'[Col]"
+    dax = re.sub(r'([,\n]\s*)([A-Za-z_][A-Za-z0-9_\s\-]+)\'\[', r"\1'\2'[", dax)
+    
+    # 2. Comillas faltantes al inicio absoluto (primera línea después de palabras clave)
+    # Patrón después de "CALCULATETABLE(", "SUMMARIZECOLUMNS(", etc.
+    dax = re.sub(r'(\()\s*([A-Za-z_][A-Za-z0-9_\s\-]+)\'\[', r"\1\n    '\2'[", dax)
+    
+    # 3. GUIDs cortados
     dax = re.sub(r"'([^']+)-'([^']+)'\[", r"'\1-\2'[", dax)
-
-    # 2. Corregir comillas anidadas mal puestas: 'stg 'RRHH_Users'[Col]' → 'stg RRHH_Users'[Col]
-    # Hacerlo múltiples veces por si hay anidación profunda
+    
+    # 4. Comillas anidadas
     for _ in range(3):
         dax = re.sub(r"'([^']+)\s+'([^']+)'\[", r"'\1 \2'[", dax)
-
-    # 3. Corregir: 'Tabla[Columna]' → 'Tabla'[Columna]
+    
+    # 5. 'Tabla[Col]' → 'Tabla'[Col]
     dax = re.sub(r"'([^']+)\[([^\]]+)\]'", r"'\1'[\2]", dax)
-
-    # 4. Corregir: Tabla[Columna] → 'Tabla'[Columna] (solo si no es función DAX)
-    # NOTA: Este paso va ANTES de la corrección de condiciones para no romper las referencias
-    funciones_dax = ["SUM", "COUNT", "AVERAGE", "MIN", "MAX", "COUNTROWS", "CALCULATE",
-                     "SUMX", "FILTER", "ALL", "VALUES", "DISTINCT", "RELATED", "DATE",
-                     "YEAR", "MONTH", "DAY", "TODAY", "NOW", "ROW", "SUMMARIZECOLUMNS",
-                     "CALCULATETABLE", "TOPN", "VAR", "RETURN", "IF", "AND", "OR"]
-
-    pattern = r"(?<!')(\b[A-Za-z_][A-Za-z0-9_\s\-]*)\[([^\]]+)\]"
-
+    
+    # 6. Tabla[Col] → 'Tabla'[Col] (solo si NO es función DAX)
+    funciones_dax = ["SUM", "COUNT", "AVERAGE", "COUNTROWS", "CALCULATE", 
+                     "SUMX", "FILTER", "DATE", "ROW", "SUMMARIZECOLUMNS",
+                     "CALCULATETABLE", "TOPN", "IF", "AND", "OR", "EVALUATE"]
+    pattern = r"(?<!')(?<![A-Z])(\b[A-Za-z_][A-Za-z0-9_\s\-]*)\[([^\]]+)\]"
+    
     def replacer(match):
         tabla = match.group(1).strip()
         columna = match.group(2)
-        # No corregir funciones DAX
         if tabla.upper() in funciones_dax:
             return match.group(0)
         return f"'{tabla}'[{columna}]"
-
+    
     dax = re.sub(pattern, replacer, dax)
-
+    
     return dax
 
 
 def _fallback_gpt_pure(prompt: str, ctx: dict) -> dict:
-    """
-    Último recurso: GPT genera DAX completo desde cero.
-    Incluye validación y corrección automática del código generado.
-    """
-    print("⚠️ Usando fallback: GPT genera DAX completo")
-
-    # Usar contexto filtrado (sin LocalDateTable)
+    """GPT genera DAX completo con detección mejorada de fechas"""
+    print("⚠️ Fallback: GPT genera DAX completo")
     ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
-
+    
+    # Fecha actual para contexto
+    fecha_hoy = datetime.datetime.now()
+    contexto_temporal = f"📅 Fecha actual: {fecha_hoy.strftime('%d/%m/%Y')}"
+    
     schema_simple = []
-    for t in ctx_filtrado[:8]:  # Limitar a 8 tablas relevantes
+    for t in ctx_filtrado[:6]:
         cols = list(t["muestra"][0].keys()) if t.get("muestra") else []
-        schema_simple.append({
-            "tabla": t["nombre"],
-            "columnas": cols[:12],
-            "filas": len(t.get("muestra", []))
-        })
+        schema_simple.append({"tabla": t["nombre"], "columnas": cols[:10]})
 
-    # Obtener fecha actual para contexto temporal
-    fecha_actual = _get_fecha_actual()
+    prompt_gpt = f"""Experto DAX Power BI. Genera query VÁLIDA y EJECUTABLE.
+{contexto_temporal}
 
-    prompt_gpt = f"""Eres un experto en Power BI DAX. Genera queries VÁLIDAS y EJECUTABLES.
+PREGUNTA: {prompt}
+SCHEMA: {json.dumps(schema_simple, ensure_ascii=False)}
 
-FECHA ACTUAL: {fecha_actual}
-Usa esta fecha para interpretar referencias temporales en la pregunta.
+REGLAS CRÍTICAS:
+1. 'NombreTabla'[Columna] ← correcto
+2. 'Tabla[Columna]' ← incorrecto
+3. Para filtros con dimensiones, USA CALCULATETABLE
+4. FECHAS: SIEMPRE usa DATE(año, mes, día) - NUNCA strings
+   - Correcto: 'Tabla'[Fecha] = DATE(2025, 11, 15)
+   - Incorrecto: 'Tabla'[Fecha] = "2025-11-15"
+5. Verifica que tablas/columnas existen
 
-PREGUNTA DEL USUARIO:
-{prompt}
-
-SCHEMA DISPONIBLE (tablas y columnas reales):
-{json.dumps(schema_simple, indent=2, ensure_ascii=False)}
-
-REGLAS CRÍTICAS DE SINTAXIS DAX:
-1. SIEMPRE usa comillas simples alrededor de nombres de tabla: 'NombreTabla'[Columna]
-2. NUNCA pongas comillas alrededor de todo: 'Tabla[Columna]' ← INCORRECTO
-3. Para filtros con dimensiones, USA CALCULATETABLE:
-   CALCULATETABLE(SUMMARIZECOLUMNS(...), Filtro1, Filtro2)
-4. Para fechas, USA DATE(): DATE(2025, 10, 27) no strings
-5. VERIFICA que tablas y columnas existen en el schema
-
-EJEMPLOS CORRECTOS:
-
-// Agregación simple por persona
-EVALUATE
-SUMMARIZECOLUMNS(
-    'stg RRHH_Users'[US_nombre],
-    "Total Días", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
-)
-
-// Con filtros (usa CALCULATETABLE)
+EJEMPLO CORRECTO con fecha:
 EVALUATE
 CALCULATETABLE(
     SUMMARIZECOLUMNS(
         'stg RRHH_Users'[US_nombre],
-        "Total", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
+        "Total", SUM('FACT'[Importe])
     ),
     'stg RRHH_Users'[US_nombre] = "Juan",
-    'FechaCalendario'[Year] = 2025
+    'FACT'[Fecha] = DATE(2025, 11, 15)
 )
 
-// Valor único sin dimensiones
-EVALUATE
-ROW(
-    "Total General", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
-)
-
-// Con filtro de fecha
-EVALUATE
-CALCULATETABLE(
-    SUMMARIZECOLUMNS(
-        'stg GEN_DptoRRHH'[DR_nombre],
-        "Total", SUM('FACT_SaldoVacaciones'[SaldoVacaciones])
-    ),
-    'FACT_SaldoVacaciones'[fecha] = DATE(2025, 10, 27)
-)
-
-GENERA SOLO EL CÓDIGO DAX sin markdown ni explicaciones:"""
+Solo código DAX:"""
 
     try:
         response = openai.ChatCompletion.create(
@@ -1381,351 +991,121 @@ GENERA SOLO EL CÓDIGO DAX sin markdown ni explicaciones:"""
             temperature=0,
             max_tokens=800,
             messages=[
-                {
-                    "role": "system",
-                    "content": "Eres un experto en DAX de Power BI. Generas código ejecutable y correcto. Respondes SOLO código DAX sin explicaciones, markdown ni comentarios."
-                },
+                {"role": "system", "content": "Experto DAX. Solo código ejecutable sin markdown."},
                 {"role": "user", "content": prompt_gpt}
             ]
         )
-
+        
         dax = response["choices"][0]["message"]["content"].strip()
-
-        # Limpiar markdown
-        dax = re.sub(r'```dax\n?|```\n?', '', dax)
-        dax = dax.strip()
-
-        print(f"🤖 DAX generado por GPT:\n{dax[:200]}...")
-
-        # ✅ CORRECCIÓN AUTOMÁTICA MEJORADA
+        dax = re.sub(r'```dax\n?|```\n?', '', dax).strip()
+        
+        print(f"🤖 DAX generado")
+        
+        # Detectar y corregir fechas mal formateadas en el DAX generado
+        # Patrón: 'Columna' = "2025-11-15" o "15/11/2025"
+        def fix_date_strings(match):
+            col_ref = match.group(1)
+            date_str = match.group(2)
+            
+            # Intentar parsear la fecha
+            formatos = ["%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"]
+            for fmt in formatos:
+                try:
+                    dt = datetime.datetime.strptime(date_str, fmt)
+                    date_func = f"DATE({dt.year}, {dt.month}, {dt.day})"
+                    print(f"🔧 Corrigiendo fecha en DAX: '{date_str}' → {date_func}")
+                    return f"{col_ref} = {date_func}"
+                except ValueError:
+                    continue
+            return match.group(0)  # Si no se puede parsear, dejar original
+        
+        # Buscar patrones de fecha como string
+        dax = re.sub(r"('[^']+'\[[^\]]+\])\s*=\s*\"(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})\"", 
+                     fix_date_strings, dax)
+        
         dax_corregido = _fix_table_quotes_v2(dax)
-
+        
         if dax_corregido != dax:
-            print(f"🔧 DAX corregido automáticamente (mostrando primeras diferencias)")
-
+            print(f"🔧 DAX corregido automáticamente")
+        
         df = _ejecutar_dax(dax_corregido, ctx["cm_seleccionado"])
         text = _resumir_resultado(df, prompt)
-
+        
         return {
             "text": text,
             "query": dax_corregido,
-            "preview": df.to_dict(orient="records"),  # Todos los datos sin limitación
-            "total_filas": len(df),
+            "preview": df.head(10).to_dict(orient="records"),
             "method": "gpt_fallback"
         }
-
+    
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Fallback GPT falló: {error_msg}")
-
-        # Dar feedback específico según el error
-        if "No se encuentra la tabla" in error_msg:
-            return {
-                "text": f"❌ No pude encontrar las tablas necesarias en el modelo. Tablas disponibles: {', '.join([t['tabla'] for t in schema_simple[:5]])}",
-                "query": dax_corregido if 'dax_corregido' in locals() else "",
-                "preview": [],
-                "method": "failed"
-            }
-
         return {
-            "text": f"❌ No pude generar una query válida. Error: {error_msg}",
-            "query": dax_corregido if 'dax_corregido' in locals() else "",
+            "text": f"❌ No pude generar query válida: {str(e)}",
+            "query": "",
             "preview": [],
             "method": "failed"
         }
 
 
 # ============================================
-# DETECCIÓN DE QUERIES MÚLTIPLES
-# ============================================
-
-def _requiere_multiples_queries(prompt: str) -> bool:
-    """
-    Detecta si la pregunta requiere múltiples queries para un análisis completo.
-    """
-    prompt_lower = prompt.lower()
-    
-    keywords_multi_query = [
-        "porcentaje", "tasa", "ratio", "%", "por ciento",
-        "comparar", "vs", "versus", "frente a", "diferencia",
-        "cuántos de los", "qué parte", "proporción",
-        "entre", "respecto", "en relación"
-    ]
-    
-    return any(kw in prompt_lower for kw in keywords_multi_query)
-
-
-def _generar_queries_complementarias(prompt: str, ctx: dict, query_principal: str, params_principales: dict) -> list[dict]:
-    """
-    Genera queries complementarias para análisis más completos.
-    Por ejemplo, si la query principal cuenta finalizados, genera también el total.
-    """
-    
-    dataset_name = ctx.get("cm_seleccionado", "")
-    prompt_lower = prompt.lower()
-    
-    queries_complementarias = []
-    
-    # Detectar contexto de la pregunta
-    es_porcentaje = any(k in prompt_lower for k in ["porcentaje", "tasa", "%", "por ciento", "proporción"])
-    es_comparacion = any(k in prompt_lower for k in ["comparar", "vs", "versus", "diferencia"])
-    
-    if es_porcentaje:
-        # Para porcentajes, necesitamos numerador y denominador
-        tabla_principal = params_principales.get("tabla_principal", "")
-        
-        # Query 1: Total general (denominador)
-        query_total = f"""EVALUATE
-ROW(
-    "Total", COUNTROWS('{tabla_principal}')
-)"""
-        queries_complementarias.append({
-            "proposito": "total_general",
-            "query": query_total,
-            "descripcion": "Total de registros para calcular porcentaje"
-        })
-        
-        # Query 2: Si hay filtros o condiciones específicas, contar con esas condiciones
-        if "finalizado" in prompt_lower or "completado" in prompt_lower or "terminado" in prompt_lower:
-            # Usar contexto filtrado
-            ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
-            # Intentar encontrar columna de estado
-            for t in ctx_filtrado:
-                if t["nombre"] == tabla_principal and t.get("muestra"):
-                    cols_raw = list(t["muestra"][0].keys())
-                    # Limpiar nombres de columnas (eliminar prefijos de tabla)
-                    cols = []
-                    for col in cols_raw:
-                        if "[" in col and "]" in col:
-                            col_limpia = col.split("[")[-1].rstrip("]")
-                        else:
-                            col_limpia = col
-                        cols.append(col_limpia)
-
-                    col_estado = None
-                    for col in cols:
-                        if any(k in col.lower() for k in ["finalizado", "completado", "estado", "status", "apto"]):
-                            col_estado = col
-                            break
-
-                    if col_estado:
-                        query_condicion = f"""EVALUATE
-ROW(
-    "Total Con Condición", CALCULATE(
-        COUNTROWS('{tabla_principal}'),
-        '{tabla_principal}'[{col_estado}] = 1
-    )
-)"""
-                        queries_complementarias.append({
-                            "proposito": "con_condicion",
-                            "query": query_condicion,
-                            "descripcion": f"Registros donde {col_estado} = 1"
-                        })
-                        break
-    
-    elif es_comparacion:
-        # Para comparaciones, puede necesitar datos de períodos diferentes o categorías
-        pass
-    
-    return queries_complementarias[:2]  # Máximo 2 queries adicionales
-
-
-# ============================================
 # FUNCIÓN PRINCIPAL
 # ============================================
 def analyze(user_prompt: str, ctx: dict, classifier_result: dict = None) -> dict:
-    """
-    Analiza la pregunta del usuario y ejecuta query(s) DAX contra Power BI
-    
-    Flujo:
-    1. Detecta si requiere múltiples queries
-    2. Selecciona patrón DAX apropiado para query principal
-    3. Extrae parámetros con GPT
-    4. Genera queries complementarias si es necesario
-    5. Ejecuta todas las queries
-    6. Resume resultados con contexto completo (como analista de FEMXA)
-    """
-    
+    """Analiza pregunta y ejecuta query DAX"""
     dataset_name = ctx.get("cm_seleccionado", "")
     
     if not dataset_name or dataset_name == "no es necesario CM":
-        return {
-            "text": "No se especificó el cuadro de mando o dataset.",
-            "query": "",
-            "preview": []
-        }
+        return {"text": "No se especificó dataset.", "query": "", "preview": []}
 
     try:
-        # 0️⃣ Detectar si requiere múltiples queries
-        requiere_multi = _requiere_multiples_queries(user_prompt)
-        print(f"{'🔢' if requiere_multi else '1️⃣'} {'Análisis multi-query' if requiere_multi else 'Query simple'}")
-        
-        # 1️⃣ Seleccionar patrón DAX para query principal
         pattern_name, pattern = _select_pattern(user_prompt)
-        print(f"🎯 Patrón seleccionado: {pattern_name}")
+        print(f"🎯 Patrón: {pattern_name}")
         
-        # 2️⃣ Extraer parámetros con GPT
         params = _extract_query_parameters(user_prompt, ctx, pattern_name)
-        
-        # 3️⃣ Construir DAX desde patrón
-        dax_query = _build_dax_from_pattern(pattern, params)
-        
-        # 4️⃣ Ejecutar query principal
+        dax_query = _build_dax_from_pattern(pattern, params, ctx)  # 🆕 Pasar contexto
         df_principal = _ejecutar_dax(dax_query, dataset_name)
 
-        # 🔁 SISTEMA DE RETRY: Si devuelve 0 resultados, intentar estrategias alternativas
+        # Retry si devuelve vacío
         if df_principal.empty and params.get("filters"):
-            print("⚠️ Query devolvió 0 resultados. Intentando estrategias alternativas...")
+            print("⚠️ 0 resultados. Intentando fallback...")
+            fallback_result = _fallback_gpt_pure(user_prompt, ctx)
+            if fallback_result["method"] != "failed":
+                return fallback_result
 
-            # Estrategia 1: Intentar sin filtros para verificar si hay datos
-            params_sin_filtros = params.copy()
-            params_sin_filtros["filters"] = []
-            dax_sin_filtros = _build_dax_from_pattern(pattern, params_sin_filtros)
-
-            try:
-                df_test = _ejecutar_dax(dax_sin_filtros, dataset_name)
-                if not df_test.empty:
-                    print(f"✅ Datos encontrados sin filtros ({len(df_test)} filas). El filtro aplicado puede ser incorrecto.")
-                    print("🔄 Intentando fallback GPT con contexto de filtros incorrectos...")
-
-                    # Usar fallback GPT con información adicional
-                    fallback_result = _fallback_gpt_pure(user_prompt, ctx)
-                    if fallback_result["method"] != "failed":
-                        return fallback_result
-            except:
-                pass
-
-            # Estrategia 2: Buscar columnas descriptivas en lugar de IDs
-            if any("id" in f["column"].lower() for f in params.get("filters", [])):
-                print("🔄 Filtro usa columnas ID. Buscando columnas descriptivas alternativas...")
-                # Intentar fallback GPT que suele elegir mejores columnas
-                fallback_result = _fallback_gpt_pure(user_prompt, ctx)
-                if fallback_result["method"] != "failed":
-                    df_principal = pd.DataFrame(fallback_result["preview"])
-                    dax_query = fallback_result["query"]
-
-        resultados = {
-            "principal": {
-                "query": dax_query,
-                "data": df_principal,
-                "preview": df_principal.to_dict(orient="records")  # Todos los datos sin limitación
-            }
-        }
-
-        # 5️⃣ Generar y ejecutar queries complementarias si es necesario
-        if requiere_multi:
-            print("🔢 Generando queries complementarias...")
-            queries_complementarias = _generar_queries_complementarias(user_prompt, ctx, dax_query, params)
-            
-            for i, q_info in enumerate(queries_complementarias, 1):
-                try:
-                    print(f"   Query {i}: {q_info['proposito']}")
-                    df_comp = _ejecutar_dax(q_info["query"], dataset_name)
-                    resultados[f"complementaria_{i}"] = {
-                        "query": q_info["query"],
-                        "data": df_comp,
-                        "proposito": q_info["proposito"],
-                        "descripcion": q_info["descripcion"],
-                        "preview": df_comp.to_dict(orient="records")
-                    }
-                except Exception as e:
-                    print(f"   ⚠️ Error en query complementaria {i}: {e}")
-                    continue
-        
-        # 6️⃣ Resumir todos los resultados
-        text = _resumir_resultado(df_principal, user_prompt, resultados if requiere_multi else None)
+        text = _resumir_resultado(df_principal, user_prompt)
         
         return {
             "text": text,
             "query": dax_query,
-            "preview": df_principal.to_dict(orient="records"),  # Todos los datos sin limitación
-            "total_filas": len(df_principal),
+            "preview": df_principal.head(20).to_dict(orient="records"),
             "pattern_used": pattern_name,
-            "parameters": params,
-            "method": "pattern_based",
-            "queries_adicionales": len(resultados) - 1 if requiere_multi else 0,
-            "resultados_completos": resultados if requiere_multi else None
+            "method": "pattern_based"
         }
         
     except Exception as e:
-        print(f"❌ Error en analyzer (patrón): {e}")
-        
-        # Si es error de columna no encontrada, dar feedback útil
-        if "No se encuentra la columna" in str(e) or "not found" in str(e).lower():
-            # Extraer el nombre de la columna del error
-            match = re.search(r"'([^']+)'", str(e))
-            if match:
-                col_problema = match.group(1)
-                
-                # Buscar columnas disponibles en todas las tablas
-                cols_disponibles = []
-                for t in ctx["contexto"]:
-                    if t.get("muestra"):
-                        tabla = t["nombre"]
-                        cols = list(t["muestra"][0].keys())
-                        cols_disponibles.extend([f"{tabla}.[{c}]" for c in cols[:5]])
-                
-                return {
-                    "text": f"❌ No pude encontrar la columna '{col_problema}'. Algunas columnas disponibles: {', '.join(cols_disponibles[:10])}",
-                    "query": dax_query if 'dax_query' in locals() else "",
-                    "preview": [],
-                    "method": "error_columna"
-                }
-        
-        # Fallback: GPT genera DAX completo
+        print(f"❌ Error analyzer: {e}")
         try:
             return _fallback_gpt_pure(user_prompt, ctx)
-        except Exception as e2:
+        except:
             return {
-                "text": f"❌ No se pudo procesar la pregunta. Error: {str(e)}. Intenta reformular la pregunta.",
+                "text": f"❌ No se pudo procesar: {str(e)}",
                 "query": "",
                 "preview": [],
                 "method": "failed"
             }
 
 
-# ============================================
-# TEST LOCAL
-# ============================================
 if __name__ == "__main__":
-    # Simular contexto para pruebas
     ctx = {
         "cm_seleccionado": "CM Gestión Horas y Vacaciones",
         "contexto": [
-            {
-                "nombre": "FACT_SaldoVacaciones",
-                "muestra": [
-                    {"EmpleadoID": 1, "SaldoVacaciones": 20, "Año": 2025},
-                    {"EmpleadoID": 2, "SaldoVacaciones": 15, "Año": 2025}
-                ]
-            },
-            {
-                "nombre": "stg RRHH_Users",
-                "muestra": [
-                    {"EmpleadoID": 1, "Nombre": "Ana García"},
-                    {"EmpleadoID": 2, "Nombre": "Juan Pérez"}
-                ]
-            },
-            {
-                "nombre": "FechaCalendario",
-                "muestra": [{"Year": 2025, "MonthNumber": 10}]
-            }
+            {"nombre": "FACT_SaldoVacaciones", 
+             "muestra": [{"EmpleadoID": 1, "SaldoVacaciones": 20}]},
+            {"nombre": "stg RRHH_Users",
+             "muestra": [{"EmpleadoID": 1, "Nombre": "Ana García"}]}
         ]
     }
-
-    # Preguntas de prueba orientadas a FEMXA
-    preguntas = [
-        "¿Cuántas vacaciones tiene cada instructor en 2025?",
-        "Dame el total de días de formación impartidos",
-        "¿Quiénes son los 5 formadores con más horas lectivas?",
-        "¿Qué porcentaje de alumnos han finalizado el curso?"
-    ]
     
-    for pregunta in preguntas:
-        print(f"\n{'='*60}")
-        print(f"PREGUNTA: {pregunta}")
-        print('='*60)
-        resultado = analyze(pregunta, ctx)
-        print(f"\n📝 RESPUESTA: {resultado['text']}")
-        print(f"\n🔧 QUERY:\n{resultado.get('query', 'N/A')}")
-        print(f"\n📊 PREVIEW: {json.dumps(resultado.get('preview', []), indent=2, ensure_ascii=False)}")
+    resultado = analyze("¿Cuántas vacaciones tiene cada instructor?", ctx)
+    print(f"\n📝 {resultado['text']}")
+    print(f"\n🔧 {resultado.get('query', '')}")
