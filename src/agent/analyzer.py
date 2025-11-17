@@ -368,16 +368,30 @@ def _validate_columns(params: dict, ctx: dict) -> dict:
                         
                         if tipo_valor in ["str", "DateTime"] or "date" in columna.lower():
                             print(f"⚠️ No se puede hacer SUM de {columna} ({tipo_valor}). Buscando numérica.")
-                            
+
                             col_numerica = None
-                            for col, val in ctx_filtrado[0]["muestra"][0].items():
-                                col_lower = col.lower()
-                                tipo_col = tipos_columnas.get(tabla, {}).get(col, "str")
-                                if tipo_col in ["int", "int64", "float", "float64"] and not any(k in col_lower for k in ["id", "key", "codigo"]):
-                                    if any(kw in col_lower for kw in ["saldo", "dias", "horas", "importe", "total", "coste", "costo"]):
-                                        col_numerica = col
-                                        break
-                            
+                            tabla_ctx = next((t for t in ctx_filtrado if t.get("nombre") == tabla and t.get("muestra")), None)
+                            if tabla_ctx:
+                                muestra_tabla = tabla_ctx["muestra"][0]
+
+                                # Primero: priorizar columnas numéricas con keywords relevantes en la MISMA tabla
+                                for col, val in muestra_tabla.items():
+                                    col_lower = col.lower()
+                                    tipo_col = tipos_columnas.get(tabla, {}).get(col, type(val).__name__)
+                                    if tipo_col in ["int", "int64", "float", "float64"] and not any(k in col_lower for k in ["id", "key", "codigo"]):
+                                        if any(kw in col_lower for kw in ["saldo", "dias", "horas", "importe", "total", "coste", "costo"]):
+                                            col_numerica = col
+                                            break
+
+                                # Segundo: si no hay keywords, tomar la primera numérica válida en la MISMA tabla
+                                if not col_numerica:
+                                    for col, val in muestra_tabla.items():
+                                        col_lower = col.lower()
+                                        tipo_col = tipos_columnas.get(tabla, {}).get(col, type(val).__name__)
+                                        if tipo_col in ["int", "int64", "float", "float64"] and not any(k in col_lower for k in ["id", "key", "codigo"]):
+                                            col_numerica = col
+                                            break
+
                             if col_numerica:
                                 params["metric_expression"] = f"SUM('{tabla}'[{col_numerica}])"
                                 print(f"✅ Usando columna numérica: {col_numerica}")
