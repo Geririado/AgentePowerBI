@@ -947,11 +947,53 @@ def _fallback_gpt_pure(prompt: str, ctx: dict) -> dict:
     """GPT genera DAX completo con detección mejorada de fechas"""
     print("⚠️ Fallback: GPT genera DAX completo")
     ctx_filtrado = _filtrar_tablas_irrelevantes(ctx.get("contexto", []))
-    
+
     # Fecha actual para contexto
     fecha_hoy = datetime.datetime.now()
     contexto_temporal = f"📅 Fecha actual: {fecha_hoy.strftime('%d/%m/%Y')}"
-    
+
+    # Columnas de fecha detectadas en el contexto para guiar al modelo
+    def _detectar_columnas_fecha(tablas_ctx):
+        columnas_fecha = []
+        formatos_fecha = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"]
+
+        for t in tablas_ctx:
+            muestra = t.get("muestra", [])
+            if not muestra:
+                continue
+
+            sample = muestra[0]
+            for col_name, val in sample.items():
+                col_lower = col_name.lower()
+                tipo_val = type(val).__name__
+
+                es_fecha = tipo_val == "datetime" or "fecha" in col_lower or "date" in col_lower
+                if not es_fecha and isinstance(val, str):
+                    valor_str = val.split()[0]
+                    for fmt in formatos_fecha:
+                        try:
+                            datetime.datetime.strptime(valor_str, fmt)
+                            es_fecha = True
+                            break
+                        except ValueError:
+                            continue
+
+                if es_fecha:
+                    columnas_fecha.append(f"'{t['nombre']}'[{col_name}]")
+
+        # Eliminar duplicados conservando orden
+        columnas_unicas = []
+        for c in columnas_fecha:
+            if c not in columnas_unicas:
+                columnas_unicas.append(c)
+        return columnas_unicas
+
+    columnas_fecha = _detectar_columnas_fecha(ctx_filtrado)
+    hint_fechas = ""
+    if columnas_fecha:
+        listado = "\n- " + "\n- ".join(columnas_fecha[:8])
+        hint_fechas = f"\nCOLUMNAS FECHA DISPONIBLES (usa estas para filtros de fecha):{listado}"
+
     schema_simple = []
     for t in ctx_filtrado[:6]:
         cols = list(t["muestra"][0].keys()) if t.get("muestra") else []
@@ -962,6 +1004,7 @@ def _fallback_gpt_pure(prompt: str, ctx: dict) -> dict:
 
 PREGUNTA: {prompt}
 SCHEMA: {json.dumps(schema_simple, ensure_ascii=False)}
+{hint_fechas}
 
 REGLAS CRÍTICAS:
 1. 'NombreTabla'[Columna] ← correcto
